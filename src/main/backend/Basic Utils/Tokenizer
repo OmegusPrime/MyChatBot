@@ -2,10 +2,10 @@ import numpy as np
 import pandas as pd 
 class Tokenizer:
     def __init__(self):
-    
+        pass
     
     def tokenize(str)->[]:
-    
+        pass
     
     def detokenize([])->str:
         

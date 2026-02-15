@@ -15,7 +15,7 @@ class FileLoader:
             elif file.suffix == ".pdf":
                 texts.append(self._load_pdf(file))
             elif file.suffix == ".csv":
-                texts.apend(self._load_csv(file))
+                texts.append(self._load_csv(file))
         return texts
     def _load_txt(self,file):
         with open(file, "r",encoding = "utf-8") as f:
