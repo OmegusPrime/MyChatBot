@@ -1,7 +1,9 @@
-import FileLoader
-class Datapipelines:
-    def __inti__(self, dir):
-        self.loader = FileLoader(dir)
+from FileLoader import FileLoader
+
+class DataPipeline:
+    def __init__(self, directory):
+        self.loader = FileLoader(directory)
+
     def run(self):
         texts = self.loader.load_all()
-        return texts
+        return texts if isinstance(texts, list) else [texts]

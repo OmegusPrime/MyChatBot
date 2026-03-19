@@ -1,11 +1,13 @@
-import numpy as np 
-import pandas as pd 
+import re
+from Datapipelines import Datapipelines
+
 class Tokenizer:
-    def __init__(self):
-        pass
-    
-    def tokenize(str)->[]:
-        pass
-    
-    def detokenize([])->str:
-        
+    def tokenize(self, text: str):
+        return re.findall(r"\w+|[^\w\s]", text)
+
+    def build_vocab(self, tokens):
+        all_words = sorted(set(tokens))
+        all_words.extend(["</endofpage>", "</unk>"])
+
+        vocab = {token: idx for idx, token in enumerate(all_words)}
+        return vocab
