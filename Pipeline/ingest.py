@@ -15,22 +15,14 @@ class Ingest:
                 try:
                     with open(file_path, 'rb') as f:
                         reader = PyPDF2.PdfReader(f)
-                        text = ""
+                        text_parts = []
                         for page in reader.pages:
                             page_text = page.extract_text()
                             if page_text:
-                                text_parts = []
-                                for page in reader.pages:
-                                    page_text = page.extract_text()
-                                    if page_text:
-                                        text_parts.append(page_text)
-                                text = " ".join(text_parts)
-
-                        yield {'file': str(file_path), 'text': text}
-
+                                text_parts.append(page_text)
+                        yield {'file': str(file_path), 'text': " ".join(text_parts)}
                 except Exception as e:
                     print(f"PDF error: {file_path} -> {e}")
-
             elif file_path.suffix == '.txt':
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
