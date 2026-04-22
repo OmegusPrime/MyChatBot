@@ -4,7 +4,7 @@ import numpy as np
 from pathlib import Path   
 import re 
 import PyPDF2 
-class Ingest:
+class ingest:
     def __init__(self,path):
         self.path = Path(path)
     def ingest(self):
