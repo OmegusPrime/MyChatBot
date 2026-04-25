@@ -5,7 +5,7 @@ from Metrics import Metrics
 from JsonFormatter import JsonFormatter, log
 import pypdf
 from charset_normalizer import from_path
-MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 CHUNK_SIZE     = 1024 * 1024
 CSV_CHUNKSIZE  = 500
 PERSONA_SEP    = "<|persona|>"
@@ -32,7 +32,6 @@ class Ingest:
         self._seen_inodes: set[int] = set()   # dedup by inode
 
     # ── Safety gates ─────────────────────────────────────────────────────
-    @staticmethod
     def _is_dotfile(self, p: Path) -> bool:
         return any(part.startswith('.') for part in p.parts)
 

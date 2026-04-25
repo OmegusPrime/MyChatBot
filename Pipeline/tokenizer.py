@@ -14,11 +14,6 @@ PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
 
 # ── GPT-2 byte→unicode shim  (H-TOK-3) ───────────────────────────────────────
 def _bytes_to_unicode() -> dict[int, str]:
-    """
-    Map every byte 0-255 to a printable unicode character.
-    Bytes already printable stay as-is; the rest are offset into a safe range.
-    This gives a 256-token base vocab that can represent any UTF-8 input.
-    """
     bs = (
         list(range(ord("!"), ord("~") + 1))
         + list(range(ord("¡"), ord("¬") + 1))
@@ -310,3 +305,5 @@ class Tokenizer:
         tok = cls()
         tok.load(path)
         return tok
+
+
