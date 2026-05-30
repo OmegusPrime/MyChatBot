@@ -8,8 +8,8 @@ if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 # --- Internal Pipeline & Structural Module Imports ---
-from Pipeline.ingest import Ingest  # Advanced document parser with safety constraints
-from Pipeline.tokenizer import Tokenizer  # Custom GPT-2-shim, stream-trained BPE module
+from Pipeline.ingest import Ingest          # Advanced document parser with safety constraints
+from Pipeline.tokenizer import Tokenizer    # Custom GPT-2-shim, stream-trained BPE module
 
 # --- Custom Neural Matrix Layer Imports ---
 from Embedding.DenseEmbeddingEngine import DenseEmbeddingEngine
@@ -81,37 +81,43 @@ def execute_end_to_end_pipeline(data_dir, bpe_json_path, export_matrix_path):
         return
 
     # -------------------------------------------------------------------------
-    # STEP 2: Pre-Training Base Dense Word Vectors (Word2Vec)
+    # STEP 2: Pre-Training Base Dense Word Vectors (Word2Vec) - MEMORY SAFE
     # -------------------------------------------------------------------------
     print("\n[Step 2/5] Optimizing core unigram noise tables and training base vectors...")
 
-    # Initialize the negative sampling tracking subsystem
+    # Initialize our vectorized sampler
     sampler = TrainingSampler(token_ids=token_id_stream, vocab_size=vocab_size, power=0.75)
 
-    # Allocate our customizable neural layers with uniform initialization boundaries
     embedding_dim = 32
-    learning_rate = 0.03
+    learning_rate = 0.001
     word2vec_engine = DenseEmbeddingEngine(vocab_size=vocab_size, embedding_dim=embedding_dim,
                                            learning_rate=learning_rate)
 
-    w2v_epochs = 5
+    w2v_epochs = 3  # Reduced epochs since vectorization yields cleaner gradient steps
     window_radius = 3
     negative_draws = 5
+    size_of_batch = 8192  # Large batch sizes leverage underlying CPU core optimizations
 
-    print(f" -> Training baseline representations across {w2v_epochs} initialization iterations...")
+    print(f" -> Training baseline representations across {w2v_epochs} vectorized iterations...")
     for epoch in range(1, w2v_epochs + 1):
-        epoch_loss = 0.0
-        steps = 0
-        samples = list(sampler.generate_window_samples(window_size=window_radius, num_negatives=negative_draws))
-        np.random.shuffle(samples)
+        epoch_cross_entropy = 0.0
+        step_iterations = 0
 
-        for target_id, pos_context_id, negative_ids in samples:
-            step_loss = word2vec_engine.optimize_step(target_id, pos_context_id, negative_ids)
-            epoch_loss += step_loss
-            steps += 1
+        # Pull high-speed array blocks out of our batch generator
+        batch_stream = sampler.generate_batch_samples(
+            window_size=window_radius,
+            num_negatives=negative_draws,
+            batch_size=size_of_batch
+        )
 
-        print(
-            f"   * W2V-Epoch [{epoch:02d}/{w2v_epochs:02d}] Finished -> Average Step Loss: {epoch_loss / max(1, steps):.5f}")
+        for batch_targets, batch_positives, batch_negatives in batch_stream:
+            # Process thousands of updates in a single execution step
+            step_loss = word2vec_engine.optimize_batch_step(batch_targets, batch_positives, batch_negatives)
+            epoch_cross_entropy += step_loss
+            step_iterations += 1
+
+        mean_step_loss = epoch_cross_entropy / max(1, step_iterations)
+        print(f"   * W2V-Epoch [{epoch:02d}/{w2v_epochs:02d}] Finished -> Mean Batch Loss: {mean_step_loss:.5f}")
 
     print(f" -> Base training complete. Exporting optimized weights array to: {export_matrix_path}")
     word2vec_engine.save_weights(export_matrix_path)
@@ -180,7 +186,7 @@ def execute_end_to_end_pipeline(data_dir, bpe_json_path, export_matrix_path):
 
     output_sequence_ids = chatbot_inference_engine.generate_response(
         initial_token_ids=input_ids,
-        max_new_tokens=12,
+        max_nex_tokens=12,
         tokenizer_eos_id=3,  # Matches standard EOS definitions inside your tokenizer
         top_k=40,
         top_p=0.85

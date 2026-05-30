@@ -6,8 +6,8 @@ class SinusoidalPositionalEncoding:
         self.max_seq_len = max_seq_len
         self.embed_dim = embed_dim
         self.pe = np.zeros((max_seq_len, embed_dim))
-        position = np.arange(0, max_seq_len).reshap(-1, 1)
-        div_term = np.exp(np.arrange(0, embed_dim, 2) * -(np.log(10000.0) / embed_dim))
+        position = np.arange(0, max_seq_len).reshape(-1, 1)
+        div_term = np.exp(np.arange(0, embed_dim, 2) * -(np.log(10000.0) / embed_dim))
         self.pe[:, 0::2] = np.sin(position * div_term)
         self.pe[:, 1::2] = np.cos(position * div_term)
 

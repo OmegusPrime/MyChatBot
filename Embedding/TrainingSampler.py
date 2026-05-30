@@ -1,51 +1,50 @@
 import numpy as np
 class TrainingSampler:
-    def __init__(self,token_ids,vocab_size,power = 0.75):
-        self.token_ids = token_ids
+    def __init__(self, token_ids, vocab_size, power=0.75):
+        self.token_ids = np.array(token_ids, dtype=np.int32)
         self.vocab_size = vocab_size
         self.power = power
         self.unigram_table = []
         self.build_unigram_noise_table()
     def build_unigram_noise_table(self):
-        counts = np.zeros(self.vocab_size, dtype=np.float64)
-        for t_id in self.token_ids:
-            if 0<=t_id<self.vocab_size:
-                counts[t_id] += 1.0
-        counts = np.maximum(counts,1e-5)
-        power_counts = np.power(counts,self.power)
-        total_sum = np.sum(power_counts)
-        probabilities = power_counts / total_sum
+        counts = np.bincount(self.token_ids, minlength=self.vocab_size).astype(np.float64)
+        counts = np.maximum(counts, 1e-5)
+        power_counts = np.power(counts, self.power)
+        probabilities = power_counts / np.sum(power_counts)
         table_size = int(1e6)
-        self.unigram_table = np.zeros(table_size,dtype=np.int32)
+        self.unigram_table = np.zeros(table_size, dtype=np.int32)
         current_idx = 0
         for token_id in range(self.vocab_size):
             fill_slots = int(round(probabilities[token_id] * table_size))
             end_idx = min(current_idx + fill_slots, table_size)
-            self.unigram_table[token_id] = token_id
+            self.unigram_table[current_idx:end_idx] = token_id
             current_idx = end_idx
         if current_idx < table_size:
-            self.unigram_table[current_idx] = self.vocab_size-1
-        def get_negative_samples(self,num_negatives,target_id, pos_context_id):
-            negatives = []
-            table_len = len(self.unigram_table)
-            while len(negatives) < num_negatives:
-                rand_idx = np.random.randint(0,table_len)
-                sample_id = self.unigram_table[rand_idx]
-                if sample_id!=target_id and sample_id!=pos_context_id:
-                    negatives.append(sample_id)
-            return negatives
-        def generate_window_samples(self,window_size = 3, num_negatives = 5):
-            total_tokens = len(self.token_ids)
-            for i, target_id in enumerate(self.token_ids):
-                if target_id< 0 or target_id>= self.vocab_size:
-                    continue
-                start = max(0,i-window_size)
-                end = min(i+window_size+1,total_tokens)
-                for j in range(start,end):
-                    if i==j:
-                        continue
-                    pos_context_id = self.token_ids[j]
-                    if pos_context_id<0 or pos_context_id>= self.vocab_size:
-                        continue
-                    negative = self.get_negative_samples(num_negatives,target_id,pos_context_id)
-                    yield int(target_id), int(pos_context_id), negative
+            self.unigram_table[current_idx:] = self.vocab_size - 1
+    def generate_batch_samples(self, window_size=3, num_negatives=5, batch_size=4096):
+        total_tokens = len(self.token_ids)
+        table_len = len(self.unigram_table)
+        targets = []
+        positives = []
+        for offset in range(-window_size, window_size + 1):
+            if offset == 0:
+                continue
+            if offset > 0:
+                t_slice = self.token_ids[:-offset]
+                p_slice = self.token_ids[offset:]
+            else:
+                t_slice = self.token_ids[-offset:]
+                p_slice = self.token_ids[:offset]
+            targets.append(t_slice)
+            positives.append(p_slice)
+        all_targets = np.concatenate(targets)
+        all_positives = np.concatenate(positives)
+        total_samples = len(all_targets)
+        for i in range(0, total_samples, batch_size):
+            end_i = min(i + batch_size, total_samples)
+            curr_batch_size = end_i - i
+            b_targets = all_targets[i:end_i]
+            b_positives = all_positives[i:end_i]
+            rand_indices = np.random.randint(0, table_len, size=(curr_batch_size, num_negatives))
+            b_negatives = self.unigram_table[rand_indices]
+            yield b_targets, b_positives, b_negatives
