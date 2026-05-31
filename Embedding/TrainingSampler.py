@@ -6,6 +6,7 @@ class TrainingSampler:
         self.power = power
         self.unigram_table = []
         self.build_unigram_noise_table()
+
     def build_unigram_noise_table(self):
         counts = np.bincount(self.token_ids, minlength=self.vocab_size).astype(np.float64)
         counts = np.maximum(counts, 1e-5)

@@ -7,9 +7,20 @@ class DenseEmbeddingEngine:
         bound = np.sqrt(6.0 / (vocab_size + embedding_dim))
         self.W_target = np.random.uniform(-bound, bound, (vocab_size, embedding_dim))
         self.W_context = np.random.uniform(-bound, bound, (vocab_size, embedding_dim))
-
     def _sigmoid(self, x):
         return 1.0 / (1.0 + np.exp(-np.clip(x, -15.0, 15.0)))
+    def expand_embedding_matrix(self, new_vocab_size):
+        current_rows = self.W_target.shape[0]
+        if new_vocab_size <= current_rows:
+            return
+        needed_rows = new_vocab_size - current_rows
+        bound = np.sqrt(6.0 / (new_vocab_size + self.dim))
+        new_targets = np.random.uniform(-bound, bound, (needed_rows, self.dim))
+        new_contexts = np.random.uniform(-bound, bound, (needed_rows, self.dim))
+        self.W_target = np.vstack([self.W_target, new_targets])
+        self.W_context = np.vstack([self.W_context, new_contexts])
+        self.vocab_size = new_vocab_size
+        print(f" -> [Matrix Expanded] Embedding Engine sizes updated to: {self.W_target.shape}")
     def optimize_batch_step(self, b_targets, b_positives, b_negatives):
         v_targets = self.W_target[b_targets]
         u_positives = self.W_context[b_positives]
