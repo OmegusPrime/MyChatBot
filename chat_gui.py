@@ -197,7 +197,7 @@ class ChatBotGUI:
                 self.conversation_history = self.conversation_history[-400:]
 
             # FIX 3: Pass the cumulative conversation history into the generation manager
-            output_sequence_ids = self.engine.generate_response(
+            output_sequence_ids = self.engine.(
                 initial_token_ids=self.conversation_history,
                 max_nex_tokens=10,
                 tokenizer_eos_id=3,

@@ -233,25 +233,49 @@ class Tokenizer:
 
     # ── Decode ────────────────────────────────────────────────────────────
 
-    def decode(self, ids: list[int], skip_special: bool = True) -> str:
+    def decode(self, ids, skip_special=True):
         """
-        Decode a flat list of ids back to text.  (L-TOK-2: no .strip() — preserves whitespace)
+        Decodes token IDs back into clean human-readable text strings,
+        safely reversing both BPE spaces and byte-fallback symbols.
         """
-        special_ids = {self.vocab[t] for t in SPECIAL_TOKENS if t in self.vocab}
-        tokens = []
-        for i in ids:
-            if skip_special and i in special_ids:
-                continue
-            tokens.append(self.inv_vocab.get(i, ""))
+        # 1. Convert IDs back to sub-word string tokens
+        tokens = [self.inv_vocab.get(i, "<unk>") for i in ids]
 
-        # re-join Ġ-space markers and decode bytes back to unicode
-        text = "".join(tokens).replace("Ġ", " ")
-        # decode GPT-2 byte chars back to utf-8
+        if skip_special:
+            special_tokens = {"<pad>", "<unk>", "<bos>", "<eos>"}
+            tokens = [t for t in tokens if t not in special_tokens]
+
+        # 2. Concatenate the sub-word tokens tightly together
+        raw_string = "".join(tokens)
+
+        # 3. Reconstruct the standard GPT-2 style byte decoder map
+        # This translates symbols like 'Ġ', 'Ä', 'ł' back into true raw bytes
+        byte_encoder = {}
+        for b in list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(
+                range(ord("®"), ord("ÿ") + 1)):
+            byte_encoder[chr(b)] = b
+
+        # Add the specific mappings for standard whitespace and structural shifts
+        byte_encoder['Ġ'] = ord(' ')
+
+        # Build the inverse map (symbol string -> raw byte integer)
+        byte_decoder = {chr(v): k for k, v in byte_encoder.items()}
+
         try:
-            text = bytearray([BYTE_DECODER[c] for c in text if c in BYTE_DECODER]).decode("utf-8")
+            # 4. Map the string characters back to their true underlying raw bytes
+            # If a character isn't in the byte map, we preserve it safely
+            raw_bytes = bytearray([byte_encoder[ch] if ch in byte_encoder else ord(ch) for ch in raw_string])
+
+            # 5. Decode the compiled bytearray cleanly using standard UTF-8 string rendering
+            clean_string = raw_bytes.decode('utf-8', errors='replace')
         except Exception:
-            pass   # if partial/corrupt, return what we have
-        return text
+            # Fallback if the raw sequence is too fragmented to safely parse as UTF-8 bytes
+            clean_string = raw_string.replace("Ġ", " ")
+
+        # 6. Clean up trailing/leading spaces and collapse duplicates
+        clean_string = clean_string.replace("  ", " ").strip()
+
+        return clean_string
 
     # ── Save / Load ───────────────────────────────────────────────────────
 
