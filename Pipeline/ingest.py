@@ -5,7 +5,6 @@ from Metrics import Metrics
 from JsonFormatter import JsonFormatter, log
 import pypdf
 from charset_normalizer import from_path
-
 MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 CSV_CHUNKSIZE = 500
@@ -13,8 +12,6 @@ PERSONA_SEP = "<|persona|>"
 UTTERANCE_SEP = "<|utterance|>"
 SPEAKER1 = "<|speaker1|>"
 SPEAKER2 = "<|speaker2|>"
-
-
 class Ingest:
     def __init__(
             self,
