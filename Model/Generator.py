@@ -1,89 +1,48 @@
-"""
-Filename: Model/Generator.py
-Description: Language Model projection heads and autoregressive inference engines
-             featuring dynamic weight mapping allocations for database expansion.
-"""
-
-import numpy as np
-
-
-class LanguageModelHead:
-    def __init__(self, embed_dim=32, vocab_size=2500):
-        self.vocab_size = vocab_size
-        limit = np.sqrt(2.0 / (embed_dim + vocab_size))
-        self.W_out = np.random.normal(0, limit, (embed_dim, vocab_size))
-        self.b_out = np.zeros(vocab_size)
-
-    def expand_projection_head(self, new_vocab_size):
-        """
-        Appends output classification nodes matching the expanded vocabulary size.
-        This resolves the AttributeError by letting matrices grow on demand.
-        """
-        current_cols = self.W_out.shape[1]
-        if new_vocab_size <= current_cols:
-            return
-
-        needed_cols = new_vocab_size - current_cols
-        limit = np.sqrt(2.0 / (self.W_out.shape[0] + new_vocab_size))
-
-        # Initialize weights and biases for the newly added structural index slots
-        new_weights = np.random.normal(0, limit, (self.W_out.shape[0], needed_cols))
-        new_biases = np.zeros(needed_cols)
-
-        # Horizontally stack columns onto your current weights matrix array
-        self.W_out = np.hstack([self.W_out, new_weights])
-        self.b_out = np.concatenate([self.b_out, new_biases])
-        print(f" -> [LM Head Expanded] Output classifications scaled up to: {self.W_out.shape}")
-
-    def forward(self, hidden_states):
-        return np.matmul(hidden_states, self.W_out) + self.b_out
-
+import torch
+import torch.nn.functional as F
 
 class ChatBotInferenceEngine:
-    def __init__(self, transformer_stack, lm_head, embedding_lookup_func):
-        self.model = transformer_stack
-        self.lm_head = lm_head
-        self.get_vector = embedding_lookup_func
+    def __init__(self, model, context_length=16):
+        self.model = model
+        self.context_length = context_length
 
-    def _softmax(self, logits):
-        exp_logits = np.exp(logits - np.max(logits))
-        return exp_logits / np.sum(exp_logits)
-
-    def sample_top_k_top_p(self, logits, top_k=50, top_p=0.9):
-        probs = self._softmax(logits)
-        sorted_indices = np.argsort(probs)[::-1]
-        sorted_probs = probs[sorted_indices]
-
-        if top_k > 0:
-            sorted_probs[top_k:] = 0.0
-
-        cumulative_probs = np.cumsum(sorted_probs)
-        to_remove = cumulative_probs > top_p
-        if np.any(to_remove):
-            first_cutoff_idx = np.argmax(to_remove) + 1
-            sorted_probs[first_cutoff_idx:] = 0.0
-
-        if np.sum(sorted_probs) == 0.0:
-            sorted_probs[:top_k] = 1.0 / top_k
-        sorted_probs = sorted_probs / np.sum(sorted_probs)
-
-        return int(np.random.choice(sorted_indices, p=sorted_probs))
-
-    def generate_response(self, initial_token_ids, max_new_tokens=15, tokenizer_eos_id=3, top_k=40, top_p=0.85):
+    @torch.no_grad()
+    def generate_response(self, initial_token_ids, max_new_tokens=20, eos_id=3, top_k=40, top_p=0.9):
+        self.model.eval()
         working_sequence = list(initial_token_ids)
+        device = next(self.model.parameters()).device
 
         for _ in range(max_new_tokens):
-            embedded_sequence = np.array([self.get_vector(t_id) for t_id in working_sequence])
-            input_tensor = np.expand_dims(embedded_sequence, axis=0)
+            # FIX #7: Cap input sequence context length to optimize execution overhead
+            context_slice = working_sequence[-self.context_length:]
+            input_tensor = torch.tensor([context_slice], dtype=torch.long, device=device)
 
-            hidden_context = self.model.forward(input_tensor)
-            logits_tensor = self.lm_head.forward(hidden_context)
+            logits = self.model(input_tensor)
+            next_token_logits = logits[0, -1, :]
 
-            last_token_logits = logits_tensor[0, -1, :]
-            next_token_id = self.sample_top_k_top_p(last_token_logits, top_k=top_k, top_p=top_p)
+            # Apply top-k filtering
+            if top_k > 0:
+                v, _ = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
+                next_token_logits[next_token_logits < v[-1]] = float('-inf')
+
+            # Apply top-p (nucleus) filtering
+            probs = F.softmax(next_token_logits, dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            next_token_logits[indices_to_remove] = float('-inf')
+
+            # Sample next token
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token_id = torch.multinomial(probs, num_samples=1).item()
 
             working_sequence.append(next_token_id)
-            if next_token_id == tokenizer_eos_id:
+            if next_token_id == eos_id:
                 break
 
         return working_sequence

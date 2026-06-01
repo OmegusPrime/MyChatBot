@@ -5,31 +5,33 @@ from Metrics import Metrics
 from JsonFormatter import JsonFormatter, log
 import pypdf
 from charset_normalizer import from_path
-MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
-CHUNK_SIZE     = 1024 * 1024
-CSV_CHUNKSIZE  = 500
-PERSONA_SEP    = "<|persona|>"
-UTTERANCE_SEP  = "<|utterance|>"
-SPEAKER1       = "<|speaker1|>"
-SPEAKER2       = "<|speaker2|>"
-class Ingest:
 
+MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
+CHUNK_SIZE = 1024 * 1024
+CSV_CHUNKSIZE = 500
+PERSONA_SEP = "<|persona|>"
+UTTERANCE_SEP = "<|utterance|>"
+SPEAKER1 = "<|speaker1|>"
+SPEAKER2 = "<|speaker2|>"
+
+
+class Ingest:
     def __init__(
-        self,
-        path,
-        *,
-        max_file_bytes: int  = MAX_FILE_BYTES,
-        chunk_size: int      = CHUNK_SIZE,
-        csv_chunksize: int   = CSV_CHUNKSIZE,
-        allowlist_dirs: list = None,     # only descend into these dir names (None = all)
+            self,
+            path,
+            *,
+            max_file_bytes: int = MAX_FILE_BYTES,
+            chunk_size: int = CHUNK_SIZE,
+            csv_chunksize: int = CSV_CHUNKSIZE,
+            allowlist_dirs: list = None,
     ):
-        self.path           = Path(path).resolve()
+        self.path = Path(path).resolve()
         self.max_file_bytes = max_file_bytes
-        self.chunk_size     = chunk_size
-        self.csv_chunksize  = csv_chunksize
+        self.chunk_size = chunk_size
+        self.csv_chunksize = csv_chunksize
         self.allowlist_dirs = set(allowlist_dirs) if allowlist_dirs else None
-        self.metrics        = Metrics()
-        self._seen_inodes: set[int] = set()   # dedup by inode
+        self.metrics = Metrics()
+        self._seen_inodes: set[int] = set()
 
     # ── Safety gates ─────────────────────────────────────────────────────
     def _is_dotfile(self, p: Path) -> bool:
@@ -89,58 +91,45 @@ class Ingest:
         size = file_path.stat().st_size
         if size > self.max_file_bytes:
             self.metrics.skipped_size += 1
-            log.warning("skip oversized file", extra={**ctx, "size_mb": round(size/1e6, 2)})
+            log.warning("skip oversized file", extra={**ctx, "size_mb": round(size / 1e6, 2)})
             return False
 
         return True
 
     # ── Encoding detection ────────────────────────────────────────────────
-
     def _read_text(self, file_path: Path) -> tuple[str, str]:
-        """
-        Detect encoding with charset-normalizer.
-        Falls back to utf-8 errors='replace' and increments warning counter.
-        Returns (text, encoding_used).
-        """
         result = from_path(file_path).best()
         if result is not None:
             return str(result), result.encoding
 
-        # fallback
         self.metrics.encoding_warns += 1
-        log.warning("encoding detection failed, using utf-8 replace",
-                    extra={"file": str(file_path)})
+        log.warning("encoding detection failed, using utf-8 replace", extra={"file": str(file_path)})
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             return f.read(), "utf-8-replace"
 
     # ── TXT ──────────────────────────────────────────────────────────────
-
     def ingest_txt(self, file_path: Path):
         ctx = {"file": str(file_path)}
         try:
             full_text, enc = self._read_text(file_path)
             log.debug("txt encoding detected", extra={**ctx, "encoding": enc})
 
-            # stream in fixed-size chunks
             for i in range(0, len(full_text), self.chunk_size):
                 chunk = full_text[i:i + self.chunk_size]
                 if chunk.strip():
                     self.metrics.ingested += 1
                     self.metrics.by_type[".txt"] += 1
                     yield {"file": str(file_path), "type": "txt", "text": chunk}
-
         except Exception:
             self.metrics.errors += 1
             log.exception("txt ingest failed", extra=ctx)
 
     # ── CSV ──────────────────────────────────────────────────────────────
-
     def ingest_csv(self, file_path: Path):
         ctx = {"file": str(file_path)}
         try:
-            for chunk_df in pd.read_csv(file_path, chunksize=self.csv_chunksize,
-                                         dtype=str, keep_default_na=False):
-                for row in chunk_df.itertuples(index=False):   # itertuples is faster than .values
+            for chunk_df in pd.read_csv(file_path, chunksize=self.csv_chunksize, dtype=str, keep_default_na=False):
+                for row in chunk_df.itertuples(index=False):
                     text = ' '.join(str(v) for v in row)
                     if text.strip():
                         self.metrics.ingested += 1
@@ -151,7 +140,6 @@ class Ingest:
             log.exception("csv ingest failed", extra=ctx)
 
     # ── PDF ──────────────────────────────────────────────────────────────
-
     def ingest_pdf(self, file_path: Path):
         ctx = {"file": str(file_path)}
         try:
@@ -163,30 +151,17 @@ class Ingest:
                         self.metrics.ingested += 1
                         self.metrics.by_type[".pdf"] += 1
                         yield {
-                            "file":    str(file_path),
-                            "type":    "pdf",
-                            "page":    page_num,
-                            "text":    text,
+                            "file": str(file_path),
+                            "type": "pdf",
+                            "page": page_num,
+                            "text": text,
                         }
         except Exception:
             self.metrics.errors += 1
             log.exception("pdf ingest failed", extra=ctx)
 
     # ── DailyDialog schema ────────────────────────────────────────────────
-
     def ingest_dailydialog(self, file_path: Path):
-        """
-        DailyDialog format: each line is a dialogue, turns separated by `__eou__`.
-        Yields one dict per dialogue with the turn list preserved.
-
-        Schema:
-            {
-                "file":   str,
-                "type":   "dailydialog",
-                "turns":  ["utterance1", "utterance2", ...],
-                "text":   "<flat joined string for tokenizer>"
-            }
-        """
         ctx = {"file": str(file_path)}
         try:
             full_text, enc = self._read_text(file_path)
@@ -202,36 +177,17 @@ class Ingest:
                 self.metrics.ingested += 1
                 self.metrics.by_type["dailydialog"] += 1
                 yield {
-                    "file":  str(file_path),
-                    "type":  "dailydialog",
+                    "file": str(file_path),
+                    "type": "dailydialog",
                     "turns": turns,
-                    "text":  " ".join(turns),
+                    "text": " ".join(turns),
                 }
         except Exception:
             self.metrics.errors += 1
             log.exception("dailydialog ingest failed", extra=ctx)
 
     # ── PersonaChat schema ────────────────────────────────────────────────
-
     def ingest_personachat(self, file_path: Path):
-        """
-        PersonaChat format (ConvAI2 train/valid .txt):
-            1 your persona: ...
-            2 your persona: ...
-            3 <speaker1 utt>\t<speaker2 utt>
-            ...
-
-        Yields one dict per conversation block.
-
-        Schema:
-            {
-                "file":      str,
-                "type":      "personachat",
-                "persona":   ["persona line 1", ...],
-                "turns":     [{"speaker": 1|2, "text": str}, ...],
-                "text":      "<|persona|> p1 p2 <|utterance|> <|speaker1|> u1 <|speaker2|> u2 ..."
-            }
-        """
         ctx = {"file": str(file_path)}
         try:
             full_text, enc = self._read_text(file_path)
@@ -249,11 +205,11 @@ class Ingest:
                     parts.append(SPEAKER1 if t["speaker"] == 1 else SPEAKER2)
                     parts.append(t["text"])
                 return {
-                    "file":    str(file_path),
-                    "type":    "personachat",
+                    "file": str(file_path),
+                    "type": "personachat",
                     "persona": list(persona),
-                    "turns":   list(turns),
-                    "text":    " ".join(parts),
+                    "turns": list(turns),
+                    "text": " ".join(parts),
                 }
 
             for line in full_text.splitlines():
@@ -266,7 +222,6 @@ class Ingest:
 
                 if "your persona:" in rest:
                     if int(idx) == 1 and turns:
-                        # new conversation block starting
                         doc = _flush()
                         if doc:
                             self.metrics.ingested += 1
@@ -281,7 +236,6 @@ class Ingest:
                         turns.append({"speaker": 1, "text": parts[0].strip()})
                         turns.append({"speaker": 2, "text": parts[1].strip()})
 
-            # flush last block
             doc = _flush()
             if doc:
                 self.metrics.ingested += 1
@@ -292,8 +246,38 @@ class Ingest:
             self.metrics.errors += 1
             log.exception("personachat ingest failed", extra=ctx)
 
-    # ── Walk ─────────────────────────────────────────────────────────────
+    # ── CRITICAL FIX: Cornell Movie Corpus Data Filter Schema ─────────────
+    def ingest_cornell_movies(self, file_path: Path):
+        """
+        CRITICAL FIX: Explicitly strips away line, speaker, and structural
+        metadata tracking markers ('+++$+++') from Cornell text files.
+        """
+        ctx = {"file": str(file_path)}
+        try:
+            full_text, enc = self._read_text(file_path)
+            log.debug("cornell movies corpus schema detected", extra={**ctx, "encoding": enc})
 
+            for line in full_text.splitlines():
+                if "+++$+++" in line:
+                    # Cornell format: lineID +++$+++ characterID +++$+++ movieID +++$+++ characterName +++$+++ text
+                    parts = line.split("+++$+++")
+                    if len(parts) >= 5:
+                        pure_dialogue = parts[4].strip()
+                        if pure_dialogue:
+                            self.metrics.ingested += 1
+                            self.metrics.by_type["cornell_movies"] += 1
+                            yield {"file": str(file_path), "type": "cornell_movies", "text": pure_dialogue}
+                else:
+                    # Fallback if text data is already clean or formatted row-by-row
+                    if line.strip():
+                        self.metrics.ingested += 1
+                        self.metrics.by_type["cornell_movies"] += 1
+                        yield {"file": str(file_path), "type": "cornell_movies", "text": line.strip()}
+        except Exception:
+            self.metrics.errors += 1
+            log.exception("cornell movies ingest failed", extra=ctx)
+
+    # ── Walk ─────────────────────────────────────────────────────────────
     def _detect_schema(self, file_path: Path):
         """Return the right handler based on filename hints or extension."""
         name = file_path.name.lower()
@@ -301,6 +285,10 @@ class Ingest:
             return self.ingest_dailydialog
         if "persona" in name or "convai" in name:
             return self.ingest_personachat
+        # Route Cornell / Movie files to our clean isolation parser method
+        if "movie" in name or "cornell" in name:
+            return self.ingest_cornell_movies
+
         return {
             ".txt": self.ingest_txt,
             ".csv": self.ingest_csv,
@@ -311,12 +299,11 @@ class Ingest:
         for dirpath, dirnames, filenames in os.walk(self.path, followlinks=False):
             dir_path = Path(dirpath)
 
-            # skip dotdirs in-place so os.walk doesn't descend into them
             dirnames[:] = [
                 d for d in dirnames
                 if not d.startswith('.')
-                and (self.allowlist_dirs is None or d in self.allowlist_dirs)
-                and self._is_confined(dir_path / d)
+                   and (self.allowlist_dirs is None or d in self.allowlist_dirs)
+                   and self._is_confined(dir_path / d)
             ]
 
             for filename in filenames:
