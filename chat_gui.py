@@ -1,229 +1,164 @@
-import os
-import sys
-import tkinter as tk
-from tkinter import scrolledtext
+"""Tkinter interface for the trained MyChatBot backend."""
+
+from __future__ import annotations
+
+import argparse
+import logging
 import threading
-import numpy as np
-import mysql.connector
+import tkinter as tk
+from pathlib import Path
+from tkinter import scrolledtext
 
-# Resolve workspace root so sibling modules import smoothly
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
+from chat_backend import ChatService
 
-# --- Custom Model Layer and Component Imports ---
-from Model.Transformer import TransformerCoreStack
-from Model.Layers import LayerNormScratch, SinusoidalPositionalEncoding, PositionWiseFeedForward
-from Model.Attention import CausalMultiHeadAttention
-from Model.Generator import LanguageModelHead, ChatBotInferenceEngine
-from Embedding.DenseEmbeddingEngine import DenseEmbeddingEngine
-
-# --- MySQL Configuration Database Credentials ---
-MYSQL_DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': 'Dhruv356564@@##',  # Replace with your recovered MySQL root password
-    'database': 'chatbot_db'
-}
-
-
-class DatabaseBackedTokenizer:
-    def __init__(self, mysql_config):
-        self.config = mysql_config
-        self.vocab = {}
-        self.inv_vocab = {}
-        self.load_vocab_from_db()
-
-    def _get_connection(self):
-        return mysql.connector.connect(**self.config)
-
-    def load_vocab_from_db(self):
-        """Syncs local tracking dictionaries with the MySQL state."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chatbot_vocabulary (
-                tokenId INT PRIMARY KEY,
-                token VARCHAR(255) UNIQUE NOT NULL
-            )
-        """)
-        conn.commit()
-
-        cursor.execute("SELECT COUNT(*) FROM chatbot_vocabulary")
-        if cursor.fetchone()[0] == 0:
-            base_tokens = [(0, '<pad>'), (1, '<unk>'), (2, '<bos>'), (3, '<eos>')]
-            cursor.executemany("INSERT INTO chatbot_vocabulary (tokenId, token) VALUES (%s, %s)", base_tokens)
-            conn.commit()
-
-        cursor.execute("SELECT token, tokenId FROM chatbot_vocabulary")
-        for token, token_id in cursor.fetchall():
-            self.vocab[token] = token_id
-            self.inv_vocab[token_id] = token
-        cursor.close()
-        conn.close()
-
-    def get_or_create_token_id(self, token_str):
-        """Returns the tokenId. If absent, creates it dynamically in MySQL."""
-        if token_str in self.vocab:
-            return self.vocab[token_str]
-
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT MAX(tokenId) FROM chatbot_vocabulary")
-            max_id = cursor.fetchone()[0]
-            next_id = 4 if max_id is None else max_id + 1
-
-            cursor.execute(
-                "INSERT INTO chatbot_vocabulary (tokenId, token) VALUES (%s, %s)",
-                (next_id, token_str)
-            )
-            conn.commit()
-
-            self.vocab[token_str] = next_id
-            self.inv_vocab[next_id] = token_str
-            return next_id
-        except mysql.connector.Error:
-            conn.rollback()
-            cursor.execute("SELECT tokenId FROM chatbot_vocabulary WHERE token = %s", (token_str,))
-            result = cursor.fetchone()
-            return result[0] if result else 1
-        finally:
-            cursor.close()
-            conn.close()
-
-    def encode_dynamic_query(self, text_string):
-        words = text_string.strip().split()
-        return [self.get_or_create_token_id(w) for w in words]
-
-    def decode(self, id_list):
-        return " ".join([self.inv_vocab.get(t_id, "<unk>") for t_id in id_list])
+BASE_DIR = Path(__file__).resolve().parent
+log = logging.getLogger(__name__)
 
 
 class ChatBotGUI:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk, artifact_dir: Path, device: str = "auto"):
         self.root = root
-        self.root.title("MySQL Dynamic AI Chat Interface")
-        self.root.geometry("450x600")
+        self.root.title("MyChatBot")
+        self.root.geometry("520x640")
+        self.root.minsize(400, 480)
         self.root.configure(bg="#1e1e1e")
+        self.service: ChatService | None = None
+        self._busy = False
 
-        # FIX 1: Initialize a persistent running memory history list for full conversations
-        self.conversation_history = []
+        self._setup_ui()
+        try:
+            self.service = ChatService(artifact_dir=artifact_dir, device=device)
+        except Exception as error:
+            log.exception("chat backend initialization failed")
+            self._append_message(
+                "System",
+                f"The trained chatbot could not be loaded: {error}",
+            )
+            self._set_busy(True)
+        else:
+            self._append_message("System", "Model loaded. You can start chatting.")
+            self.entry_field.focus_set()
 
-        print("Connecting to local running MySQL Instance...")
-        self.tokenizer = DatabaseBackedTokenizer(MYSQL_DB_CONFIG)
-        self.initialize_chatbot_backend()
-        self.setup_ui_layout()
-
-    def initialize_chatbot_backend(self):
-        vocab_size = max(len(self.tokenizer.vocab), 10)
-
-        self.embed_engine = DenseEmbeddingEngine(vocab_size=vocab_size, embedding_dim=32)
-        self.transformer = TransformerCoreStack(vocab_size=vocab_size, embed_dim=32, num_blocks=2)
-        self.language_head = LanguageModelHead(embed_dim=32, vocab_size=vocab_size)
-
-        self.engine = ChatBotInferenceEngine(
-            transformer_stack=self.transformer,
-            lm_head=self.language_head,
-            embedding_lookup_func=self.embed_engine.get_token_vector
-        )
-
-    def setup_ui_layout(self):
+    def _setup_ui(self) -> None:
         self.chat_display = scrolledtext.ScrolledText(
-            self.root, wrap=tk.WORD, bg="#2d2d2d", fg="#ffffff", font=("Arial", 11), state=tk.DISABLED
+            self.root,
+            wrap=tk.WORD,
+            bg="#2d2d2d",
+            fg="#ffffff",
+            insertbackground="white",
+            font=("Arial", 11),
+            state=tk.DISABLED,
         )
         self.chat_display.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.chat_display.tag_config("user", foreground="#4fc1ff", font=("Arial", 11, "bold"))
+        self.chat_display.tag_config("bot", foreground="#9cdcfe")
+        self.chat_display.tag_config("system", foreground="#6a9955", font=("Arial", 9, "italic"))
 
         input_frame = tk.Frame(self.root, bg="#1e1e1e")
         input_frame.pack(padx=10, pady=(0, 10), fill=tk.X)
 
         self.entry_field = tk.Entry(
-            input_frame, bg="#3d3d3d", fg="#ffffff", insertbackground="white", font=("Arial", 11), relief=tk.FLAT
+            input_frame,
+            bg="#3d3d3d",
+            fg="#ffffff",
+            insertbackground="white",
+            font=("Arial", 11),
+            relief=tk.FLAT,
         )
         self.entry_field.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=8)
-        self.entry_field.bind("<Return>", self.on_send_triggered)
+        self.entry_field.bind("<Return>", self._on_send)
 
-        send_button = tk.Button(
-            input_frame, text="Send", bg="#007acc", fg="#ffffff", font=("Arial", 10, "bold"),
-            relief=tk.FLAT, command=self.on_send_triggered
+        self.send_button = tk.Button(
+            input_frame,
+            text="Send",
+            bg="#007acc",
+            fg="#ffffff",
+            font=("Arial", 10, "bold"),
+            relief=tk.FLAT,
+            command=self._on_send,
         )
-        send_button.pack(side=tk.RIGHT, padx=(5, 0), ipady=5, ipadx=15)
-        self.append_message_to_window("System", "MySQL Connected. Tokens register automatically on input turns!")
+        self.send_button.pack(side=tk.RIGHT, padx=(5, 0), ipady=5, ipadx=12)
 
-    def append_message_to_window(self, sender, text):
+        self.reset_button = tk.Button(
+            input_frame,
+            text="Reset",
+            bg="#555555",
+            fg="#ffffff",
+            relief=tk.FLAT,
+            command=self._on_reset,
+        )
+        self.reset_button.pack(side=tk.RIGHT, padx=(5, 0), ipady=5, ipadx=8)
+
+    def _append_message(self, sender: str, text: str) -> None:
         self.chat_display.config(state=tk.NORMAL)
         if sender == "You":
-            self.chat_display.insert(tk.END, f"\nYou: {text}\n", "user_tag")
-        elif sender == "System":
-            self.chat_display.insert(tk.END, f"[{text}]\n", "system_tag")
+            self.chat_display.insert(tk.END, f"\nYou: {text}\n", "user")
+        elif sender == "Chatbot":
+            self.chat_display.insert(tk.END, f"\nChatbot: {text}\n", "bot")
         else:
-            self.chat_display.insert(tk.END, f"\nChatbot: {text}\n", "bot_tag")
-
-        self.chat_display.tag_config("user_tag", foreground="#4fc1ff", font=("Arial", 11, "bold"))
-        self.chat_display.tag_config("bot_tag", foreground="#9cdcfe")
-        self.chat_display.tag_config("system_tag", foreground="#6a9955", font=("Arial", 9, "italic"))
+            self.chat_display.insert(tk.END, f"[{text}]\n", "system")
         self.chat_display.config(state=tk.DISABLED)
         self.chat_display.see(tk.END)
 
-    def on_send_triggered(self, event=None):
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.send_button.config(state=state)
+        self.reset_button.config(state=state)
+        self.entry_field.config(state=state)
+        if not busy:
+            self.entry_field.focus_set()
+
+    def _on_send(self, event=None) -> str | None:
+        if self._busy or self.service is None:
+            return "break" if event is not None else None
         user_text = self.entry_field.get().strip()
         if not user_text:
-            return
+            return "break" if event is not None else None
 
         self.entry_field.delete(0, tk.END)
-        self.append_message_to_window("You", user_text)
+        self._append_message("You", user_text)
+        self._set_busy(True)
+        threading.Thread(
+            target=self._generate_response,
+            args=(user_text,),
+            daemon=True,
+        ).start()
+        return "break" if event is not None else None
 
-        worker_thread = threading.Thread(target=self.process_bot_response, args=(user_text,))
-        worker_thread.start()
-
-    def process_bot_response(self, prompt_text):
+    def _generate_response(self, user_text: str) -> None:
         try:
-            # 1. Map user query strings to Token IDs (and expand MySQL)
-            new_input_ids = self.tokenizer.encode_dynamic_query(prompt_text)
+            assert self.service is not None
+            response = self.service.reply(user_text)
+        except Exception as error:
+            log.exception("response generation failed")
+            self.root.after(0, self._finish_response, "System", f"Response failed: {error}")
+        else:
+            self.root.after(0, self._finish_response, "Chatbot", response)
 
-            # FIX 2: Append the new user input tokens to the running history array
-            self.conversation_history.extend(new_input_ids)
+    def _finish_response(self, sender: str, text: str) -> None:
+        self._append_message(sender, text)
+        self._set_busy(False)
 
-            # 2. Check and scale matrix dimensions to handle vocabulary growth
-            current_vocab_count = len(self.tokenizer.vocab)
-            self.embed_engine.expand_embedding_matrix(current_vocab_count)
-            self.language_head.expand_projection_head(current_vocab_count)
+    def _on_reset(self) -> None:
+        if self._busy or self.service is None:
+            return
+        self.service.reset()
+        self._append_message("System", "Conversation reset.")
 
-            # Update inference engine configuration references
-            self.engine.vocab_size = current_vocab_count
 
-            # Slidely bound conversation context to prevent exceeding maximum matrix length (512 tokens)
-            if len(self.conversation_history) > 400:
-                self.conversation_history = self.conversation_history[-400:]
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Start the MyChatBot desktop interface")
+    parser.add_argument("--artifact-dir", type=Path, default=BASE_DIR / "artifacts")
+    parser.add_argument("--device", default="auto")
+    args = parser.parse_args(argv)
 
-            # FIX 3: Pass the cumulative conversation history into the generation manager
-            output_sequence_ids = self.engine.(
-                initial_token_ids=self.conversation_history,
-                max_nex_tokens=10,
-                tokenizer_eos_id=3,
-                top_k=10,
-                top_p=0.8
-            )
-
-            # Extract ONLY the newly generated tokens appended at the end of the input sequence
-            newly_generated_ids = output_sequence_ids[len(self.conversation_history):]
-
-            # FIX 4: Append the chatbot's own generated response tokens to the ongoing history context
-            self.conversation_history.extend(newly_generated_ids)
-
-            # Decode numbers back to whitespace-separated strings
-            response_string = self.tokenizer.decode(newly_generated_ids)
-
-            if not response_string.strip():
-                response_string = "..."
-
-            self.root.after(0, self.append_message_to_window, "Chatbot", response_string)
-
-        except Exception as err:
-            self.root.after(0, self.append_message_to_window, "System", f"Runtime Error: {str(err)}")
+    logging.basicConfig(level=logging.INFO)
+    root = tk.Tk()
+    ChatBotGUI(root, artifact_dir=args.artifact_dir, device=args.device)
+    root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    root_window = tk.Tk()
-    app = ChatBotGUI(root_window)
-    root_window.mainloop()
+    raise SystemExit(main())

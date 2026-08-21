@@ -1,0 +1,6 @@
+charset-normalizer
+numpy
+pandas
+pypdf
+pytest
+torch

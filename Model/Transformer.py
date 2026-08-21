@@ -6,6 +6,10 @@ import math
 class CausalMultiHeadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
         super().__init__()
+        if embed_dim <= 0 or num_heads <= 0:
+            raise ValueError("embed_dim and num_heads must be positive")
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
         self.num_heads = num_heads
         self.embed_dim = embed_dim
         self.head_dim = embed_dim // num_heads
@@ -65,7 +69,20 @@ class TransformerDecoderBlock(nn.Module):
 class TransformerCoreStack(nn.Module):
     def __init__(self, vocab_size, embed_dim=128, num_heads=4, d_ff=512, num_blocks=4, max_seq_len=512):
         super().__init__()
-        # FIX #8: Expanded embedding scale for rich semantic capacity
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
+        if max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
+
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.num_blocks = num_blocks
+        self.max_seq_len = max_seq_len
+
         self.token_embeddings = nn.Embedding(vocab_size, embed_dim)
         self.position_embeddings = nn.Embedding(max_seq_len, embed_dim)
 
@@ -79,8 +96,18 @@ class TransformerCoreStack(nn.Module):
         self.token_embeddings.weight = self.lm_head.weight
 
     def forward(self, token_ids):
+        if token_ids.dtype != torch.long:
+            raise TypeError(f"token_ids must have dtype torch.long, got {token_ids.dtype}")
+        if token_ids.ndim != 2:
+            raise ValueError(f"token_ids must have shape (batch, sequence), got {tuple(token_ids.shape)}")
         B, T = token_ids.shape
         device = token_ids.device
+        if T == 0:
+            raise ValueError("token_ids cannot contain an empty sequence")
+        if T > self.max_seq_len:
+            raise ValueError(f"sequence length {T} exceeds max_seq_len {self.max_seq_len}")
+        if token_ids.numel() and (token_ids.min().item() < 0 or token_ids.max().item() >= self.vocab_size):
+            raise ValueError(f"token IDs must be in [0, {self.vocab_size})")
 
         pos = torch.arange(0, T, dtype=torch.long, device=device).unsqueeze(0)
         x = self.token_embeddings(token_ids) + self.position_embeddings(pos)
@@ -90,3 +117,13 @@ class TransformerCoreStack(nn.Module):
 
         logits = self.lm_head(self.ln_f(x))
         return logits
+
+    def config(self) -> dict:
+        return {
+            "vocab_size": self.vocab_size,
+            "embed_dim": self.embed_dim,
+            "num_heads": self.num_heads,
+            "d_ff": self.d_ff,
+            "num_blocks": self.num_blocks,
+            "max_seq_len": self.max_seq_len,
+        }

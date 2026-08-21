@@ -1,26 +1,91 @@
+"""Safe, schema-aware conversational dataset ingestion."""
+
+from __future__ import annotations
+
+import ast
+import io
 import os
-import pandas as pd
+import tokenize
 from pathlib import Path
-from Metrics import Metrics
-from JsonFormatter import JsonFormatter, log
+from typing import Iterable
+
+import pandas as pd
 import pypdf
 from charset_normalizer import from_path
+
+from .JsonFormatter import log
+from .Metrics import Metrics
+
 MAX_FILE_BYTES = 10 * 1024 * 1024 * 1024
 CHUNK_SIZE = 1024 * 1024
 CSV_CHUNKSIZE = 500
-PERSONA_SEP = "<|persona|>"
-UTTERANCE_SEP = "<|utterance|>"
-SPEAKER1 = "<|speaker1|>"
-SPEAKER2 = "<|speaker2|>"
+
+USER_TOKEN = "<user>"
+ASSISTANT_TOKEN = "<assistant>"
+EOS_TOKEN = "<eos>"
+
+IGNORED_DATASET_FILES = {
+    ".ds_store",
+    "movie_characters_metadata.txt",
+    "movie_titles_metadata.txt",
+    "raw_script_urls.txt",
+    "readme.txt",
+    "chameleons.pdf",
+}
+
+
+def format_conversation(turns: Iterable[str]) -> str:
+    """Format alternating turns using the model's canonical control tokens."""
+    cleaned = [str(turn).strip() for turn in turns if str(turn).strip()]
+    if not cleaned:
+        return ""
+    pieces: list[str] = []
+    for index, turn in enumerate(cleaned):
+        role = USER_TOKEN if index % 2 == 0 else ASSISTANT_TOKEN
+        pieces.extend((role, " ", turn, "\n"))
+    pieces.append(EOS_TOKEN)
+    return "".join(pieces)
+
+
+def parse_serialized_turns(value: str) -> list[str]:
+    """Parse the adjacent Python string literals used by the dialogue CSV files."""
+    source = str(value).strip()
+    if not source:
+        return []
+
+    turns: list[str] = []
+    try:
+        for token_info in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token_info.type == tokenize.STRING:
+                parsed = ast.literal_eval(token_info.string)
+                if isinstance(parsed, str) and parsed.strip():
+                    turns.append(parsed.strip())
+    except (SyntaxError, tokenize.TokenError, ValueError):
+        turns = []
+
+    if turns:
+        return turns
+
+    try:
+        parsed = ast.literal_eval(source)
+    except (SyntaxError, ValueError):
+        return []
+    if isinstance(parsed, (list, tuple)):
+        return [str(turn).strip() for turn in parsed if str(turn).strip()]
+    if isinstance(parsed, str) and parsed.strip():
+        return [parsed.strip()]
+    return []
+
+
 class Ingest:
     def __init__(
-            self,
-            path,
-            *,
-            max_file_bytes: int = MAX_FILE_BYTES,
-            chunk_size: int = CHUNK_SIZE,
-            csv_chunksize: int = CSV_CHUNKSIZE,
-            allowlist_dirs: list = None,
+        self,
+        path,
+        *,
+        max_file_bytes: int = MAX_FILE_BYTES,
+        chunk_size: int = CHUNK_SIZE,
+        csv_chunksize: int = CSV_CHUNKSIZE,
+        allowlist_dirs: list[str] | None = None,
     ):
         self.path = Path(path).resolve()
         self.max_file_bytes = max_file_bytes
@@ -30,289 +95,288 @@ class Ingest:
         self.metrics = Metrics()
         self._seen_inodes: set[int] = set()
 
-    # ── Safety gates ─────────────────────────────────────────────────────
-    def _is_dotfile(self, p: Path) -> bool:
-        return any(part.startswith('.') for part in p.parts)
+    # Safety gates -----------------------------------------------------
 
-    def _is_symlink(self, p: Path) -> bool:
+    def _is_dotfile(self, path: Path) -> bool:
         try:
-            for part in [p, *p.parents]:
-                if part.is_symlink():
+            relative = path.resolve().relative_to(self.path)
+        except ValueError:
+            return True
+        return any(part.startswith(".") for part in relative.parts)
+
+    def _is_symlink(self, path: Path) -> bool:
+        try:
+            current = path
+            while True:
+                if current.is_symlink():
                     return True
-                if part == self.path:
+                if current == self.path or current.parent == current:
                     break
+                current = current.parent
         except OSError:
             return True
         return False
 
-    def _is_confined(self, p: Path) -> bool:
+    def _is_confined(self, path: Path) -> bool:
         try:
-            p.resolve().relative_to(self.path)
+            path.resolve().relative_to(self.path)
             return True
         except ValueError:
             return False
 
-    def _is_duplicate_inode(self, p: Path) -> bool:
+    def _is_duplicate_inode(self, path: Path) -> bool:
         try:
-            inode = p.stat().st_ino
+            inode = path.stat().st_ino
+            if not inode:
+                return False
             if inode in self._seen_inodes:
                 return True
             self._seen_inodes.add(inode)
-            return False
         except OSError:
             return False
+        return False
 
-    def _safe(self, file_path: Path) -> bool:
-        ctx = {"file": str(file_path)}
-
-        if self._is_dotfile(file_path):
+    def _safe(self, path: Path) -> bool:
+        context = {"file": str(path)}
+        if self._is_dotfile(path):
             self.metrics.skipped_dotfile += 1
-            log.debug("skip dotfile", extra=ctx)
             return False
-
-        if self._is_symlink(file_path):
+        if self._is_symlink(path):
             self.metrics.skipped_symlink += 1
-            log.warning("skip symlink", extra=ctx)
+            log.warning("skip symlink", extra=context)
             return False
-
-        if not self._is_confined(file_path):
+        if not self._is_confined(path):
             self.metrics.skipped_confined += 1
-            log.warning("skip path-traversal attempt", extra=ctx)
+            log.warning("skip path outside dataset root", extra=context)
             return False
-
-        if self._is_duplicate_inode(file_path):
+        if self._is_duplicate_inode(path):
             self.metrics.skipped_inode += 1
-            log.debug("skip duplicate inode", extra=ctx)
             return False
-
-        size = file_path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self.metrics.errors += 1
+            log.exception("cannot stat input", extra=context)
+            return False
         if size > self.max_file_bytes:
             self.metrics.skipped_size += 1
-            log.warning("skip oversized file", extra={**ctx, "size_mb": round(size / 1e6, 2)})
+            log.warning("skip oversized file", extra={**context, "size": size})
             return False
-
         return True
 
-    # ── Encoding detection ────────────────────────────────────────────────
-    def _read_text(self, file_path: Path) -> tuple[str, str]:
-        result = from_path(file_path).best()
+    # Readers ----------------------------------------------------------
+
+    def _read_text(self, path: Path) -> tuple[str, str]:
+        result = from_path(path).best()
         if result is not None:
-            return str(result), result.encoding
-
+            return str(result), result.encoding or "unknown"
         self.metrics.encoding_warns += 1
-        log.warning("encoding detection failed, using utf-8 replace", extra={"file": str(file_path)})
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            return f.read(), "utf-8-replace"
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return handle.read(), "utf-8-replace"
 
-    # ── TXT ──────────────────────────────────────────────────────────────
-    def ingest_txt(self, file_path: Path):
-        ctx = {"file": str(file_path)}
+    def _emit(self, path: Path, doc_type: str, text: str, *, split: str = "train", **extra):
+        if not text.strip():
+            return None
+        self.metrics.record(doc_type)
+        return {
+            "file": str(path),
+            "type": doc_type,
+            "split": split,
+            "text": text,
+            **extra,
+        }
+
+    def ingest_txt(self, path: Path):
         try:
-            full_text, enc = self._read_text(file_path)
-            log.debug("txt encoding detected", extra={**ctx, "encoding": enc})
-
-            for i in range(0, len(full_text), self.chunk_size):
-                chunk = full_text[i:i + self.chunk_size]
-                if chunk.strip():
-                    self.metrics.ingested += 1
-                    self.metrics.by_type[".txt"] += 1
-                    yield {"file": str(file_path), "type": "txt", "text": chunk}
+            full_text, encoding = self._read_text(path)
+            for offset in range(0, len(full_text), self.chunk_size):
+                packet = self._emit(
+                    path,
+                    ".txt",
+                    full_text[offset:offset + self.chunk_size],
+                    encoding=encoding,
+                )
+                if packet:
+                    yield packet
         except Exception:
             self.metrics.errors += 1
-            log.exception("txt ingest failed", extra=ctx)
+            log.exception("txt ingest failed", extra={"file": str(path)})
 
-    # ── CSV ──────────────────────────────────────────────────────────────
-    def ingest_csv(self, file_path: Path):
-        ctx = {"file": str(file_path)}
+    def ingest_csv(self, path: Path):
         try:
-            for chunk_df in pd.read_csv(file_path, chunksize=self.csv_chunksize, dtype=str, keep_default_na=False):
-                for row in chunk_df.itertuples(index=False):
-                    text = ' '.join(str(v) for v in row)
-                    if text.strip():
-                        self.metrics.ingested += 1
-                        self.metrics.by_type[".csv"] += 1
-                        yield {"file": str(file_path), "type": "csv", "text": text}
+            for frame in pd.read_csv(
+                path,
+                chunksize=self.csv_chunksize,
+                dtype=str,
+                keep_default_na=False,
+            ):
+                for row in frame.itertuples(index=False):
+                    packet = self._emit(path, ".csv", " ".join(str(value) for value in row))
+                    if packet:
+                        yield packet
         except Exception:
             self.metrics.errors += 1
-            log.exception("csv ingest failed", extra=ctx)
+            log.exception("csv ingest failed", extra={"file": str(path)})
 
-    # ── PDF ──────────────────────────────────────────────────────────────
-    def ingest_pdf(self, file_path: Path):
-        ctx = {"file": str(file_path)}
+    def ingest_pdf(self, path: Path):
         try:
-            with open(file_path, 'rb') as f:
-                reader = pypdf.PdfReader(f)
-                for page_num, page in enumerate(reader.pages, start=1):
-                    text = page.extract_text()
-                    if text and text.strip():
-                        self.metrics.ingested += 1
-                        self.metrics.by_type[".pdf"] += 1
-                        yield {
-                            "file": str(file_path),
-                            "type": "pdf",
-                            "page": page_num,
-                            "text": text,
-                        }
+            with path.open("rb") as handle:
+                reader = pypdf.PdfReader(handle)
+                for page_number, page in enumerate(reader.pages, start=1):
+                    packet = self._emit(path, ".pdf", page.extract_text() or "", page=page_number)
+                    if packet:
+                        yield packet
         except Exception:
             self.metrics.errors += 1
-            log.exception("pdf ingest failed", extra=ctx)
+            log.exception("pdf ingest failed", extra={"file": str(path)})
 
-    # ── DailyDialog schema ────────────────────────────────────────────────
-    def ingest_dailydialog(self, file_path: Path):
-        ctx = {"file": str(file_path)}
+    # Conversational schemas ------------------------------------------
+
+    def ingest_dialog_csv(self, path: Path):
+        split = path.stem.lower()
         try:
-            full_text, enc = self._read_text(file_path)
-            log.debug("dailydialog encoding", extra={**ctx, "encoding": enc})
+            for frame in pd.read_csv(
+                path,
+                chunksize=self.csv_chunksize,
+                dtype=str,
+                keep_default_na=False,
+            ):
+                if "dialog" not in frame.columns:
+                    raise ValueError(f"{path.name} has no 'dialog' column")
+                for value in frame["dialog"]:
+                    turns = parse_serialized_turns(value)
+                    text = format_conversation(turns)
+                    packet = self._emit(path, "dailydialog", text, split=split, turns=turns)
+                    if packet:
+                        yield packet
+        except Exception:
+            self.metrics.errors += 1
+            log.exception("dialogue CSV ingest failed", extra={"file": str(path)})
 
-            for line in full_text.splitlines():
-                line = line.strip()
-                if not line:
+    def ingest_personality_csv(self, path: Path):
+        try:
+            for frame in pd.read_csv(
+                path,
+                chunksize=self.csv_chunksize,
+                dtype=str,
+                keep_default_na=False,
+            ):
+                if "chat" not in frame.columns:
+                    raise ValueError(f"{path.name} has no 'chat' column")
+                for _, row in frame.iterrows():
+                    turns = [turn.strip() for turn in str(row["chat"]).splitlines() if turn.strip()]
+                    text = format_conversation(turns)
+                    packet = self._emit(
+                        path,
+                        "personachat",
+                        text,
+                        turns=turns,
+                        persona=str(row.get("Persona", "")).strip(),
+                    )
+                    if packet:
+                        yield packet
+        except Exception:
+            self.metrics.errors += 1
+            log.exception("personality CSV ingest failed", extra={"file": str(path)})
+
+    def _load_cornell_lines(self, path: Path) -> dict[str, str]:
+        full_text, _ = self._read_text(path)
+        line_map: dict[str, str] = {}
+        for row in full_text.splitlines():
+            fields = [field.strip() for field in row.split("+++$+++")]
+            if len(fields) >= 5 and fields[0] and fields[4]:
+                line_map[fields[0]] = fields[4]
+        return line_map
+
+    def ingest_cornell_conversations(self, path: Path):
+        line_path = path.with_name("movie_lines.txt")
+        try:
+            if not line_path.exists():
+                raise FileNotFoundError(f"Missing Cornell line file: {line_path}")
+            line_map = self._load_cornell_lines(line_path)
+            full_text, _ = self._read_text(path)
+            for row in full_text.splitlines():
+                fields = [field.strip() for field in row.split("+++$+++")]
+                if len(fields) < 4:
                     continue
-                turns = [t.strip() for t in line.split("__eou__") if t.strip()]
-                if not turns:
+                try:
+                    line_ids = ast.literal_eval(fields[-1])
+                except (SyntaxError, ValueError):
                     continue
-                self.metrics.ingested += 1
-                self.metrics.by_type["dailydialog"] += 1
-                yield {
-                    "file": str(file_path),
-                    "type": "dailydialog",
-                    "turns": turns,
-                    "text": " ".join(turns),
-                }
+                turns = [line_map[line_id] for line_id in line_ids if line_id in line_map]
+                packet = self._emit(
+                    path,
+                    "cornell_movies",
+                    format_conversation(turns),
+                    turns=turns,
+                    line_ids=line_ids,
+                )
+                if packet:
+                    yield packet
         except Exception:
             self.metrics.errors += 1
-            log.exception("dailydialog ingest failed", extra=ctx)
+            log.exception("Cornell conversation ingest failed", extra={"file": str(path)})
 
-    # ── PersonaChat schema ────────────────────────────────────────────────
-    def ingest_personachat(self, file_path: Path):
-        ctx = {"file": str(file_path)}
+    def ingest_cornell_lines(self, path: Path):
+        """Fallback for a standalone movie_lines fixture without conversation indexes."""
         try:
-            full_text, enc = self._read_text(file_path)
-            log.debug("personachat encoding", extra={**ctx, "encoding": enc})
-
-            persona, turns = [], []
-
-            def _flush():
-                if not (persona or turns):
-                    return None
-                parts = [PERSONA_SEP]
-                parts += persona
-                parts.append(UTTERANCE_SEP)
-                for t in turns:
-                    parts.append(SPEAKER1 if t["speaker"] == 1 else SPEAKER2)
-                    parts.append(t["text"])
-                return {
-                    "file": str(file_path),
-                    "type": "personachat",
-                    "persona": list(persona),
-                    "turns": list(turns),
-                    "text": " ".join(parts),
-                }
-
-            for line in full_text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                idx, _, rest = line.partition(" ")
-                if not idx.isdigit():
-                    continue
-
-                if "your persona:" in rest:
-                    if int(idx) == 1 and turns:
-                        doc = _flush()
-                        if doc:
-                            self.metrics.ingested += 1
-                            self.metrics.by_type["personachat"] += 1
-                            yield doc
-                        persona.clear()
-                        turns.clear()
-                    persona.append(rest.split("your persona:", 1)[1].strip())
-                else:
-                    parts = rest.split("\t")
-                    if len(parts) >= 2:
-                        turns.append({"speaker": 1, "text": parts[0].strip()})
-                        turns.append({"speaker": 2, "text": parts[1].strip()})
-
-            doc = _flush()
-            if doc:
-                self.metrics.ingested += 1
-                self.metrics.by_type["personachat"] += 1
-                yield doc
-
+            for line_id, text in self._load_cornell_lines(path).items():
+                packet = self._emit(
+                    path,
+                    "cornell_movies",
+                    format_conversation([text]),
+                    turns=[text],
+                    line_id=line_id,
+                )
+                if packet:
+                    yield packet
         except Exception:
             self.metrics.errors += 1
-            log.exception("personachat ingest failed", extra=ctx)
+            log.exception("Cornell line ingest failed", extra={"file": str(path)})
 
-    # ── CRITICAL FIX: Cornell Movie Corpus Data Filter Schema ─────────────
-    def ingest_cornell_movies(self, file_path: Path):
-        """
-        CRITICAL FIX: Explicitly strips away line, speaker, and structural
-        metadata tracking markers ('+++$+++') from Cornell text files.
-        """
-        ctx = {"file": str(file_path)}
-        try:
-            full_text, enc = self._read_text(file_path)
-            log.debug("cornell movies corpus schema detected", extra={**ctx, "encoding": enc})
+    # Routing and traversal -------------------------------------------
 
-            for line in full_text.splitlines():
-                if "+++$+++" in line:
-                    # Cornell format: lineID +++$+++ characterID +++$+++ movieID +++$+++ characterName +++$+++ text
-                    parts = line.split("+++$+++")
-                    if len(parts) >= 5:
-                        pure_dialogue = parts[4].strip()
-                        if pure_dialogue:
-                            self.metrics.ingested += 1
-                            self.metrics.by_type["cornell_movies"] += 1
-                            yield {"file": str(file_path), "type": "cornell_movies", "text": pure_dialogue}
-                else:
-                    # Fallback if text data is already clean or formatted row-by-row
-                    if line.strip():
-                        self.metrics.ingested += 1
-                        self.metrics.by_type["cornell_movies"] += 1
-                        yield {"file": str(file_path), "type": "cornell_movies", "text": line.strip()}
-        except Exception:
-            self.metrics.errors += 1
-            log.exception("cornell movies ingest failed", extra=ctx)
-
-    # ── Walk ─────────────────────────────────────────────────────────────
-    def _detect_schema(self, file_path: Path):
-        """Return the right handler based on filename hints or extension."""
-        name = file_path.name.lower()
+    def _detect_schema(self, path: Path):
+        name = path.name.lower()
+        if name in IGNORED_DATASET_FILES:
+            return None
+        if name == "movie_conversations.txt":
+            return self.ingest_cornell_conversations
+        if name == "movie_lines.txt":
+            conversation_path = path.with_name("movie_conversations.txt")
+            return None if conversation_path.exists() else self.ingest_cornell_lines
+        if name == "personality.csv":
+            return self.ingest_personality_csv
+        if name in {"train.csv", "validation.csv", "test.csv"}:
+            return self.ingest_dialog_csv
         if "dailydialog" in name:
-            return self.ingest_dailydialog
-        if "persona" in name or "convai" in name:
-            return self.ingest_personachat
-        # Route Cornell / Movie files to our clean isolation parser method
-        if "movie" in name or "cornell" in name:
-            return self.ingest_cornell_movies
-
+            return self.ingest_txt
         return {
             ".txt": self.ingest_txt,
             ".csv": self.ingest_csv,
             ".pdf": self.ingest_pdf,
-        }.get(file_path.suffix.lower())
+        }.get(path.suffix.lower())
 
     def ingest(self):
-        for dirpath, dirnames, filenames in os.walk(self.path, followlinks=False):
-            dir_path = Path(dirpath)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Dataset path does not exist: {self.path}")
 
+        for directory, dirnames, filenames in os.walk(self.path, followlinks=False):
+            directory_path = Path(directory)
             dirnames[:] = [
-                d for d in dirnames
-                if not d.startswith('.')
-                   and (self.allowlist_dirs is None or d in self.allowlist_dirs)
-                   and self._is_confined(dir_path / d)
+                dirname
+                for dirname in dirnames
+                if not dirname.startswith(".")
+                and (self.allowlist_dirs is None or dirname in self.allowlist_dirs)
+                and self._is_confined(directory_path / dirname)
             ]
 
-            for filename in filenames:
-                file_path = dir_path / filename
-
-                if not self._safe(file_path):
+            for filename in sorted(filenames):
+                path = directory_path / filename
+                if not self._safe(path):
                     continue
-
-                handler = self._detect_schema(file_path)
-                if handler is None:
-                    continue
-
-                yield from handler(file_path)
+                handler = self._detect_schema(path)
+                if handler is not None:
+                    yield from handler(path)
 
         log.info("ingest complete", extra={"metrics": self.metrics.report()})

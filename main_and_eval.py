@@ -1,254 +1,547 @@
+"""Prepare data, train MyChatBot, or start terminal chat.
+
+Examples:
+    python main_and_eval.py --prepare
+    python main_and_eval.py --train
+    python main_and_eval.py --chat
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
 import os
-import sys
-import re
-import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 
-# Resolve workspace root (D:\MyChatBot) so sibling directories cross-import cleanly
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
+from Pipeline.ingest import Ingest
+from Pipeline.tokenizer import EOS_ID, Tokenizer
 
-# --- Internal Pipeline & Structural Module Imports ---
-from Pipeline.ingest import Ingest  # Advanced document parser with metadata filtering
-from Pipeline.tokenizer import Tokenizer  # Custom GPT-2-shim, stream-trained BPE module
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_DATASET_DIR = BASE_DIR / "Dataset"
+DEFAULT_ARTIFACT_DIR = BASE_DIR / "artifacts"
+ARTIFACT_FORMAT_VERSION = 1
 
-# --- Custom Architecture Core & Generator Head Imports ---
-from Model.Transformer import TransformerCoreStack
-from Model.Generator import ChatBotInferenceEngine
-
-# --- Configuration Matrix Hyperparameters ---
 EMBED_DIM = 128
 NUM_HEADS = 4
 D_FF = 512
 NUM_BLOCKS = 4
+MAX_SEQ_LEN = 512
 CONTEXT_LENGTH = 32
 BATCH_SIZE = 64
 LM_EPOCHS = 5
 LEARNING_RATE = 5e-4
-
-# --- Hardcoded Project Path Environment Bindings ---
-DATASET_DIRECTORY = os.path.join(BASE_DIR, "Dataset")
-BPE_CONFIG_PATH = os.path.join(BASE_DIR, "Pipeline", "bpe.json")
-BINARY_NPY_PATH = os.path.join(BASE_DIR, "Embedding", "token_stream.npy")
-MODEL_CHECKPOINT_PATH = os.path.join(BASE_DIR, "Embedding", "chatbot_transformer.pt")
+VOCAB_SIZE = 2500
 
 
-def load_token_stream(data_dir, bpe_path, db_path, npy_path):
-    """
-    Self-healing cache engine. Automatically detects missing token streams,
-    parses raw text via the filtered Ingest layout, and caches a clean binary stream.
-    """
-    # 1. Initialize or load the trained sub-word BPE tokenizer
-    if not os.path.exists(bpe_path):
-        print(" -> Presaved BPE config not found. Training vocabulary from ingest...")
-        tokenizer = Tokenizer.train_from_ingest(data_dir=data_dir, vocab_size=2500, save_path=bpe_path)
-    else:
-        print(f" -> Loading Tokenizer from file asset: {bpe_path}")
-        tokenizer = Tokenizer.from_pretrained(bpe_path)
-
-    # 2. Check for an active binary token stream cache file on disk
-    if os.path.exists(npy_path):
-        print(f" -> FAST CACHE HIT: Loading token stream from binary file: {npy_path}")
-        token_stream = np.load(npy_path)
-        return tokenizer, token_stream
-
-    # 3. SELF-HEALING FALLBACK: Build token stream from scratch if missing
-    print(f" -> CACHE MISS: Generating clean token stream array map into {npy_path}...")
-
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS processed_documents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, file_name TEXT, doc_type TEXT, raw_text TEXT
-        )
-    """)
-    conn.commit()
-
-    cursor.execute("SELECT COUNT(*) FROM processed_documents")
-    if cursor.fetchone()[0] == 0:
-        print(" -> Parsing raw data source files via metadata-filtered Ingest schema...")
-        ingest_worker = Ingest(path=data_dir)
-        batch_buffer = []
-        for packet in ingest_worker.ingest():
-            text_chunk = packet.get("text", "")
-            if text_chunk.strip():
-                batch_buffer.append((packet.get("file", "unknown"), packet.get("type", "txt"), text_chunk))
-                if len(batch_buffer) >= 1000:
-                    cursor.executemany(
-                        "INSERT INTO processed_documents (file_name, doc_type, raw_text) VALUES (%s, %s)", batch_buffer)
-                    conn.commit()
-                    batch_buffer.clear()
-        if batch_buffer:
-            cursor.executemany("INSERT INTO processed_documents (file_name, doc_type, raw_text) VALUES (?, ?, ?)",
-                               batch_buffer)
-            conn.commit()
-
-    print(" -> Running BPE tokenizer across database rows to build a clean binary cache layer...")
-    token_id_stream = []
-    cursor.execute("SELECT raw_text FROM processed_documents")
-    for row in cursor.fetchall():
-        encoded_ids = tokenizer.encode(row[0], add_special=False)
-        token_id_stream.extend(encoded_ids)
-    conn.close()
-
-    # Save to disk as an explicit NumPy array map for instantaneous subsequent launches
-    token_stream = np.array(token_id_stream, dtype=np.int32)
-    np.save(npy_path, token_stream)
-    print(f" -> SUCCESS: Clean binary token stream cache written to: {npy_path}")
-
-    return tokenizer, token_stream
+@dataclass(frozen=True)
+class ArtifactPaths:
+    root: Path
+    tokenizer: Path
+    train_stream: Path
+    validation_stream: Path
+    test_stream: Path
+    metadata: Path
+    checkpoint: Path
+    response_index: Path
 
 
-def train_generative_model(model, token_stream, epochs, batch_size, context_len, lr, device):
-    """
-    Executes deep architecture optimization passes utilizing fully vectorized
-    PyTorch layers, Cross-Entropy calculations, and gradient clipping safety boundaries.
-    """
-    model.train()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    criterion = nn.CrossEntropyLoss()
-
-    total_tokens = len(token_stream)
-    max_samples_per_epoch = min(200000, total_tokens - context_len - 1)
-
-    print(f" -> Commencing model optimization loops across {device} device targets...")
-    for epoch in range(1, epochs + 1):
-        total_loss = 0.0
-        steps = 0
-
-        start_indices = np.random.randint(0, total_tokens - context_len - 1, size=max_samples_per_epoch)
-
-        for i in range(0, len(start_indices), batch_size):
-            batch_starts = start_indices[i: i + batch_size]
-            if len(batch_starts) < batch_size:
-                continue
-
-            X_list, Y_list = [], []
-            for start in batch_starts:
-                X_list.append(token_stream[start: start + context_len])
-                Y_list.append(token_stream[start + 1: start + context_len + 1])
-
-            X = torch.tensor(np.array(X_list), dtype=torch.long, device=device)
-            Y = torch.tensor(np.array(Y_list), dtype=torch.long, device=device)
-
-            optimizer.zero_grad()
-            logits = model(X)
-
-            loss = criterion(logits.view(-1, logits.size(-1)), Y.view(-1))
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            total_loss += loss.item()
-            steps += 1
-
-        print(
-            f"   * Epoch [{epoch:02d}/{epochs:02d}] Completed -> Mean Training Loss: {total_loss / max(1, steps):.4f}")
-
-    torch.save(model.state_dict(), MODEL_CHECKPOINT_PATH)
-    print(f" -> Saved active structural transformer checkpoint file to: {MODEL_CHECKPOINT_PATH}")
-
-
-def run_interactive_terminal_chat(tokenizer, model, device):
-    """
-    Orchestrates an interactive, multi-turn dialogue loop. Directly matches training IDs
-    and strips away lingering Byte-Pair Encoding structural character noise.
-    """
-    inference_engine = ChatBotInferenceEngine(model, context_length=CONTEXT_LENGTH)
-
-    print("\n" + "=" * 80)
-    print(" >>> SYSTEM GENERATIVE CHATBOT CONVERSATION ENGINE ONLINE <<<")
-    print(" Instructions: Type your message and press Enter. Type 'END' to exit safely.")
-    print("=" * 80 + "\n")
-
-    conversation_history = []
-
-    while True:
-        user_query = input("You: ").strip()
-        if user_query.upper() == "END":
-            print("\nShutting down interactive session parameters. Goodbye!")
-            break
-        if not user_query:
-            continue
-
-        encoded_input_ids = tokenizer.encode(user_query, add_special=False)
-        conversation_history.extend(encoded_input_ids)
-
-        if len(conversation_history) > CONTEXT_LENGTH:
-            conversation_history = conversation_history[-CONTEXT_LENGTH:]
-
-        output_ids = inference_engine.generate_response(
-            initial_token_ids=conversation_history,
-            max_new_tokens=20,
-            eos_id=3,
-            top_k=5,
-            top_p=0.85
-        )
-
-        newly_generated_tokens = output_ids[len(conversation_history):]
-        conversation_history.extend(newly_generated_tokens)
-
-        # Decode token array sequence
-        response_text = tokenizer.decode(newly_generated_tokens, skip_special=True)
-
-        # CRITICAL FILTER LAYER: Strip BPE specific translation artifacts (Ä, ł, Ġ)
-        response_text = re.sub(r'[ÄłĠ]+', '', response_text)
-
-        # Collapse multiple spacing anomalies into clean single whitespace divisions
-        response_text = re.sub(r'\s+', ' ', response_text).strip()
-
-        if not response_text or response_text == "...":
-            response_text = "..."
-
-        print(f"Chatbot: {response_text}\n")
-
-
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SQLITE_DB_PATH = os.path.join(BASE_DIR, "Pipeline", "chatbot_cache.db")
-
-    if os.path.exists(SQLITE_DB_PATH) and not os.path.exists(BINARY_NPY_PATH):
-        print(" -> Old staging cache database found with un-filtered entries. Purging for clean build...")
-        try:
-            os.remove(SQLITE_DB_PATH)
-        except OSError:
-            pass
-
-    print("Checking system data cache state dependencies...")
-    tokenizer, token_stream = load_token_stream(
-        data_dir=DATASET_DIRECTORY,
-        bpe_path=BPE_CONFIG_PATH,
-        db_path=SQLITE_DB_PATH,
-        npy_path=BINARY_NPY_PATH
+def artifact_paths(root: str | Path = DEFAULT_ARTIFACT_DIR) -> ArtifactPaths:
+    root_path = Path(root).resolve()
+    return ArtifactPaths(
+        root=root_path,
+        tokenizer=root_path / "tokenizer.json",
+        train_stream=root_path / "train_token_stream.npy",
+        validation_stream=root_path / "validation_token_stream.npy",
+        test_stream=root_path / "test_token_stream.npy",
+        metadata=root_path / "token_stream.meta.json",
+        checkpoint=root_path / "chatbot_transformer.pt",
+        response_index=root_path / "response_pairs.db",
     )
 
-    vocab_size = tokenizer.vocab_size
-    print(f" -> Loaded vocabulary capacity layout: {vocab_size} tokens.")
-    print(f" -> Active stream sequence configuration volume: {len(token_stream):,} tokens.")
 
-    model = TransformerCoreStack(
+def sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dataset_fingerprint(data_dir: str | Path) -> str:
+    root = Path(data_dir).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {root}")
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        stat = path.stat()
+        digest.update(relative.encode("utf-8"))
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _atomic_numpy(path: Path, values: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as handle:
+        np.save(handle, values)
+    os.replace(temporary, path)
+
+
+def _validate_stream(stream: np.ndarray, tokenizer: Tokenizer, name: str, *, required: bool) -> None:
+    if stream.ndim != 1:
+        raise ValueError(f"{name} token stream must be one-dimensional")
+    if not np.issubdtype(stream.dtype, np.integer):
+        raise TypeError(f"{name} token stream must use an integer dtype")
+    if required and len(stream) <= CONTEXT_LENGTH + 1:
+        raise ValueError(f"{name} token stream is too short: {len(stream)} tokens")
+    if len(stream) and (int(stream.min()) < 0 or int(stream.max()) >= tokenizer.vocab_size):
+        raise ValueError(f"{name} token stream contains IDs outside the tokenizer vocabulary")
+
+
+def _metadata_is_current(paths: ArtifactPaths, data_dir: Path) -> bool:
+    required = (
+        paths.tokenizer,
+        paths.train_stream,
+        paths.validation_stream,
+        paths.test_stream,
+        paths.metadata,
+    )
+    if not all(path.exists() for path in required):
+        return False
+    try:
+        metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
+        return (
+            metadata.get("format_version") == ARTIFACT_FORMAT_VERSION
+            and metadata.get("dataset_fingerprint") == dataset_fingerprint(data_dir)
+            and metadata.get("tokenizer_sha256") == sha256_file(paths.tokenizer)
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def prepare_artifacts(
+    data_dir: str | Path = DEFAULT_DATASET_DIR,
+    artifact_dir: str | Path = DEFAULT_ARTIFACT_DIR,
+    *,
+    vocab_size: int = VOCAB_SIZE,
+    force: bool = False,
+) -> ArtifactPaths:
+    """Build a tokenizer and split-specific token streams from clean conversations."""
+    data_path = Path(data_dir).resolve()
+    paths = artifact_paths(artifact_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    if not force and _metadata_is_current(paths, data_path):
+        if not paths.response_index.exists():
+            from response_index import build_response_index
+
+            print("Building missing conversational response index...")
+            stats = build_response_index(data_path, paths.response_index)
+            metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
+            metadata["response_index"] = stats
+            _atomic_json(paths.metadata, metadata)
+        print(f"Prepared artifacts are current in {paths.root}")
+        return paths
+
+    print("Preparing conversational dataset...")
+    tokenizer = Tokenizer.train_from_ingest(
+        data_dir=str(data_path),
         vocab_size=vocab_size,
+        save_path=str(paths.tokenizer),
+        split="train",
+    )
+    tokenizer_hash = sha256_file(paths.tokenizer)
+
+    streams: dict[str, list[int]] = {"train": [], "validation": [], "test": []}
+    record_counts = {"train": 0, "validation": 0, "test": 0}
+    worker = Ingest(data_path)
+    for packet in worker.ingest():
+        split = packet.get("split", "train")
+        if split not in streams:
+            split = "train"
+        encoded = tokenizer.encode(packet["text"], add_special=False)
+        if not encoded:
+            continue
+        if encoded[-1] != EOS_ID:
+            encoded.append(EOS_ID)
+        streams[split].extend(encoded)
+        record_counts[split] += 1
+
+    if worker.metrics.errors:
+        raise RuntimeError(
+            f"Dataset preparation encountered {worker.metrics.errors} ingestion errors; "
+            "inspect the preceding log messages"
+        )
+
+    arrays = {
+        name: np.asarray(token_ids, dtype=np.int32)
+        for name, token_ids in streams.items()
+    }
+    _validate_stream(arrays["train"], tokenizer, "train", required=True)
+    _validate_stream(arrays["validation"], tokenizer, "validation", required=False)
+    _validate_stream(arrays["test"], tokenizer, "test", required=False)
+
+    _atomic_numpy(paths.train_stream, arrays["train"])
+    _atomic_numpy(paths.validation_stream, arrays["validation"])
+    _atomic_numpy(paths.test_stream, arrays["test"])
+
+    from response_index import build_response_index
+
+    print("Building conversational response index...")
+    response_index_stats = build_response_index(data_path, paths.response_index)
+
+    metadata = {
+        "format_version": ARTIFACT_FORMAT_VERSION,
+        "dataset_fingerprint": dataset_fingerprint(data_path),
+        "tokenizer_sha256": tokenizer_hash,
+        "vocab_size": tokenizer.vocab_size,
+        "record_counts": record_counts,
+        "token_counts": {name: int(len(values)) for name, values in arrays.items()},
+        "ingestion_metrics": worker.metrics.report(),
+        "response_index": response_index_stats,
+    }
+    _atomic_json(paths.metadata, metadata)
+
+    print(f"Tokenizer vocabulary: {tokenizer.vocab_size:,}")
+    for name in ("train", "validation", "test"):
+        print(f"{name.title():>10}: {record_counts[name]:,} records, {len(arrays[name]):,} tokens")
+    print(f"Prepared artifacts written to {paths.root}")
+    return paths
+
+
+def load_prepared_artifacts(
+    data_dir: str | Path = DEFAULT_DATASET_DIR,
+    artifact_dir: str | Path = DEFAULT_ARTIFACT_DIR,
+):
+    data_path = Path(data_dir).resolve()
+    paths = artifact_paths(artifact_dir)
+    if not _metadata_is_current(paths, data_path):
+        raise RuntimeError(
+            "Prepared artifacts are missing or stale. Run main_and_eval.py --prepare first."
+        )
+    tokenizer = Tokenizer.from_pretrained(str(paths.tokenizer))
+    train_stream = np.load(paths.train_stream, allow_pickle=False)
+    validation_stream = np.load(paths.validation_stream, allow_pickle=False)
+    test_stream = np.load(paths.test_stream, allow_pickle=False)
+    _validate_stream(train_stream, tokenizer, "train", required=True)
+    _validate_stream(validation_stream, tokenizer, "validation", required=False)
+    _validate_stream(test_stream, tokenizer, "test", required=False)
+    return paths, tokenizer, train_stream, validation_stream, test_stream
+
+
+def _resolve_device(requested: str):
+    import torch
+
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    return device
+
+
+def _batches(
+    stream: np.ndarray,
+    *,
+    context_len: int,
+    batch_size: int,
+    sample_count: int,
+    rng: np.random.Generator,
+    device,
+):
+    import torch
+
+    max_start = len(stream) - context_len - 1
+    if max_start < 0:
+        raise ValueError(
+            f"Token stream has {len(stream)} tokens but needs at least {context_len + 1}"
+        )
+    starts = rng.integers(0, max_start + 1, size=sample_count)
+    for offset in range(0, len(starts), batch_size):
+        batch_starts = starts[offset:offset + batch_size]
+        x_rows = [stream[start:start + context_len] for start in batch_starts]
+        y_rows = [stream[start + 1:start + context_len + 1] for start in batch_starts]
+        X = torch.as_tensor(np.asarray(x_rows), dtype=torch.long, device=device)
+        Y = torch.as_tensor(np.asarray(y_rows), dtype=torch.long, device=device)
+        yield X, Y
+
+
+def evaluate_model(
+    model,
+    stream: np.ndarray,
+    *,
+    context_len: int,
+    batch_size: int,
+    device,
+    seed: int,
+    max_batches: int = 50,
+) -> float:
+    import torch
+    import torch.nn as nn
+
+    if len(stream) <= context_len + 1:
+        return math.nan
+    criterion = nn.CrossEntropyLoss()
+    sample_count = min(max_batches * batch_size, len(stream) - context_len)
+    rng = np.random.default_rng(seed)
+    losses: list[float] = []
+    model.eval()
+    with torch.no_grad():
+        for X, Y in _batches(
+            stream,
+            context_len=context_len,
+            batch_size=batch_size,
+            sample_count=sample_count,
+            rng=rng,
+            device=device,
+        ):
+            logits = model(X)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), Y.reshape(-1))
+            losses.append(float(loss.item()))
+    return float(np.mean(losses)) if losses else math.nan
+
+
+def _save_checkpoint(path: Path, payload: dict) -> None:
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def train_generative_model(
+    model,
+    train_stream: np.ndarray,
+    validation_stream: np.ndarray,
+    tokenizer: Tokenizer,
+    checkpoint_path: str | Path,
+    *,
+    epochs: int = LM_EPOCHS,
+    batch_size: int = BATCH_SIZE,
+    context_len: int = CONTEXT_LENGTH,
+    learning_rate: float = LEARNING_RATE,
+    max_samples_per_epoch: int = 50_000,
+    device,
+    seed: int = 42,
+    tokenizer_hash: str,
+) -> Path:
+    import torch
+    import torch.nn as nn
+
+    if epochs <= 0 or batch_size <= 0 or max_samples_per_epoch <= 0:
+        raise ValueError("epochs, batch_size, and max_samples_per_epoch must be positive")
+    if len(train_stream) <= context_len + 1:
+        raise ValueError("Training token stream is too short")
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    sample_count = min(max_samples_per_epoch, len(train_stream) - context_len)
+    checkpoint = Path(checkpoint_path).resolve()
+    best_metric = math.inf
+
+    print(f"Training on {device} with {sample_count:,} sampled windows per epoch")
+    for epoch in range(1, epochs + 1):
+        model.train()
+        rng = np.random.default_rng(seed + epoch)
+        total_loss = 0.0
+        steps = 0
+        for X, Y in _batches(
+            train_stream,
+            context_len=context_len,
+            batch_size=batch_size,
+            sample_count=sample_count,
+            rng=rng,
+            device=device,
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(X)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), Y.reshape(-1))
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite training loss at epoch {epoch}, step {steps + 1}")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += float(loss.item())
+            steps += 1
+
+        scheduler.step()
+        train_loss = total_loss / max(steps, 1)
+        validation_loss = evaluate_model(
+            model,
+            validation_stream,
+            context_len=context_len,
+            batch_size=batch_size,
+            device=device,
+            seed=seed,
+        )
+        selection_metric = validation_loss if math.isfinite(validation_loss) else train_loss
+        print(
+            f"Epoch {epoch:02d}/{epochs:02d} - "
+            f"train loss {train_loss:.4f} - "
+            f"validation loss {validation_loss:.4f}"
+        )
+
+        if selection_metric < best_metric:
+            best_metric = selection_metric
+            _save_checkpoint(
+                checkpoint,
+                {
+                    "format_version": 1,
+                    "model_state": model.state_dict(),
+                    "model_config": model.config(),
+                    "context_length": context_len,
+                    "tokenizer_sha256": tokenizer_hash,
+                    "vocab_size": tokenizer.vocab_size,
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "validation_loss": validation_loss,
+                },
+            )
+            print(f"Saved best checkpoint to {checkpoint}")
+
+    return checkpoint
+
+
+def train_command(args) -> Path:
+    try:
+        paths, tokenizer, train_stream, validation_stream, _ = load_prepared_artifacts(
+            args.data_dir,
+            args.artifact_dir,
+        )
+    except RuntimeError:
+        paths = prepare_artifacts(
+            args.data_dir,
+            args.artifact_dir,
+            vocab_size=args.vocab_size,
+            force=args.rebuild,
+        )
+        paths, tokenizer, train_stream, validation_stream, _ = load_prepared_artifacts(
+            args.data_dir,
+            args.artifact_dir,
+        )
+
+    import torch
+    from Model.Transformer import TransformerCoreStack
+
+    device = _resolve_device(args.device)
+    model = TransformerCoreStack(
+        vocab_size=tokenizer.vocab_size,
         embed_dim=EMBED_DIM,
         num_heads=NUM_HEADS,
         d_ff=D_FF,
         num_blocks=NUM_BLOCKS,
-        max_seq_len=512
+        max_seq_len=MAX_SEQ_LEN,
     ).to(device)
+    return train_generative_model(
+        model,
+        train_stream,
+        validation_stream,
+        tokenizer,
+        paths.checkpoint,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        context_len=args.context_length,
+        learning_rate=args.learning_rate,
+        max_samples_per_epoch=args.max_samples,
+        device=device,
+        seed=args.seed,
+        tokenizer_hash=sha256_file(paths.tokenizer),
+    )
 
-    if os.path.exists(MODEL_CHECKPOINT_PATH):
-        print(f" -> Found existing model checkpoint asset at {MODEL_CHECKPOINT_PATH}. Loading weights...")
-        model.load_state_dict(torch.load(MODEL_CHECKPOINT_PATH, map_location=device))
-    else:
-        print("\n -> Training transformer parameters from a clean initialized state...")
-        train_generative_model(model, token_stream, LM_EPOCHS, BATCH_SIZE, CONTEXT_LENGTH, LEARNING_RATE, device)
 
-    run_interactive_terminal_chat(tokenizer, model, device)
+def run_terminal_chat(artifact_dir: str | Path, device: str = "auto") -> None:
+    from chat_backend import ChatService
+
+    service = ChatService(artifact_dir=artifact_dir, device=device)
+    print("\nMyChatBot is ready. Type END to exit and RESET to clear conversation history.\n")
+    while True:
+        user_text = input("You: ").strip()
+        if user_text.upper() == "END":
+            break
+        if user_text.upper() == "RESET":
+            service.reset()
+            print("Conversation reset.\n")
+            continue
+        if not user_text:
+            continue
+        try:
+            print(f"Chatbot: {service.reply(user_text)}\n")
+        except Exception as error:
+            print(f"Chatbot error: {error}\n")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Prepare, train, or run MyChatBot")
+    parser.add_argument("--prepare", action="store_true", help="build tokenizer and token streams")
+    parser.add_argument("--train", action="store_true", help="train and save the transformer")
+    parser.add_argument("--chat", action="store_true", help="start terminal chat")
+    parser.add_argument("--index", action="store_true", help="build only the response-pair index")
+    parser.add_argument("--rebuild", action="store_true", help="force artifact preparation")
+    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATASET_DIR)
+    parser.add_argument("--artifact-dir", type=Path, default=DEFAULT_ARTIFACT_DIR)
+    parser.add_argument("--vocab-size", type=int, default=VOCAB_SIZE)
+    parser.add_argument("--epochs", type=int, default=LM_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--context-length", type=int, default=CONTEXT_LENGTH)
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE)
+    parser.add_argument("--max-samples", type=int, default=50_000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or another torch device")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not (args.prepare or args.train or args.chat or args.rebuild or args.index):
+        parser.print_help()
+        return 0
+
+    if args.prepare or args.rebuild:
+        prepare_artifacts(
+            args.data_dir,
+            args.artifact_dir,
+            vocab_size=args.vocab_size,
+            force=args.rebuild,
+        )
+    if args.index and not (args.prepare or args.rebuild):
+        from response_index import build_response_index
+
+        paths = artifact_paths(args.artifact_dir)
+        paths.root.mkdir(parents=True, exist_ok=True)
+        stats = build_response_index(args.data_dir, paths.response_index)
+        if paths.metadata.exists():
+            metadata = json.loads(paths.metadata.read_text(encoding="utf-8"))
+            metadata["response_index"] = stats
+            _atomic_json(paths.metadata, metadata)
+        print(f"Response index written to {paths.response_index}: {stats}")
+    if args.train:
+        train_command(args)
+    if args.chat:
+        run_terminal_chat(args.artifact_dir, args.device)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

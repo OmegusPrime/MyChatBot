@@ -2,7 +2,9 @@ import re
 import json
 import logging
 import collections
-from ingest import Ingest                          # H-TOK-1: relative-safe direct import
+import os
+from pathlib import Path
+from .ingest import Ingest
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log = logging.getLogger("tokenizer")
@@ -11,6 +13,10 @@ log = logging.getLogger("tokenizer")
 SPECIAL_TOKENS = ["<pad>", "<unk>", "<bos>", "<eos>",
                   "<user>", "<assistant>", "<sep>", "<mask>"]
 PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
+TOKENIZER_FORMAT_VERSION = 1
+SPECIAL_TOKEN_PATTERN = re.compile(
+    "(" + "|".join(re.escape(token) for token in sorted(SPECIAL_TOKENS, key=len, reverse=True)) + ")"
+)
 
 # ── GPT-2 byte→unicode shim  (H-TOK-3) ───────────────────────────────────────
 def _bytes_to_unicode() -> dict[int, str]:
@@ -64,13 +70,24 @@ class Tokenizer:
     def _pretokenize(text: str) -> list[list[str]]:
         tokens = []
         for m in Tokenizer.PRE_TOK.finditer(text):
-            word = m.group()
-            # Ġ prefix marks a leading space (GPT-2 convention)
-            raw = ("Ġ" + word.lstrip(" ")) if word.startswith(" ") else word
-            chars = Tokenizer._word_to_bytes(raw)   # H-TOK-3: byte-level
+            # Encode the original bytes. BYTE_ENCODER itself maps ASCII space
+            # to the visible Ġ symbol; adding Ġ here would double-encode it.
+            chars = Tokenizer._word_to_bytes(m.group())
             if chars:
                 tokens.append(chars)
         return tokens
+
+    @staticmethod
+    def _segments(text: str):
+        """Yield (is_special, value) segments without tokenizing control tokens."""
+        cursor = 0
+        for match in SPECIAL_TOKEN_PATTERN.finditer(text):
+            if match.start() > cursor:
+                yield False, text[cursor:match.start()]
+            yield True, match.group(0)
+            cursor = match.end()
+        if cursor < len(text):
+            yield False, text[cursor:]
 
     @staticmethod
     def _get_pairs(word: list[str]) -> list[tuple]:
@@ -97,14 +114,19 @@ class Tokenizer:
             self._add_token(ch)
         self._add_token("Ġ")
 
-        # ── 3. Pre-tokenize corpus (streaming)  (H-TOK-4) ─────────────────
+        # ── 3. Count pre-tokenized words without retaining every occurrence ─
         log.info("Pre-tokenising corpus …")
-        corpus: list[tuple] = []        # list of tuples (immutable → hashable)
+        word_counts: collections.Counter = collections.Counter()
+        total_words = 0
         for text in texts:
-            for chars in self._pretokenize(text):
-                corpus.append(tuple(chars))
+            for is_special, segment in self._segments(text):
+                if is_special:
+                    continue
+                for chars in self._pretokenize(segment):
+                    word_counts[tuple(chars)] += 1
+                    total_words += 1
 
-        log.info(f"Corpus: {len(corpus):,} words")
+        log.info(f"Corpus: {total_words:,} words, {len(word_counts):,} unique")
 
         # ── 4. Build inverted pair index  (C-TOK-2) ───────────────────────
         # pair_counts[pair]               = total frequency
@@ -112,7 +134,6 @@ class Tokenizer:
         pair_counts: collections.Counter = collections.Counter()
         pair_index: dict[tuple, collections.Counter] = collections.defaultdict(collections.Counter)
 
-        word_counts: collections.Counter = collections.Counter(corpus)
         # corpus as list-of-unique-words for index
         words: list[tuple] = list(word_counts.keys())
         # working copy — mutable
@@ -124,6 +145,10 @@ class Tokenizer:
                 pair_counts[pair]        += freq
                 pair_index[pair][idx]    += freq
 
+        if vocab_size < len(self.vocab):
+            raise ValueError(
+                f"vocab_size must be at least the byte-level base size {len(self.vocab)}"
+            )
         num_merges = vocab_size - len(self.vocab)
         log.info(f"Base vocab: {len(self.vocab)}  |  merges to learn: {num_merges}")
 
@@ -218,79 +243,87 @@ class Tokenizer:
             word = new_word
         return [self.vocab.get(tok, UNK_ID) for tok in word]  # C-TOK-4: real UNK_ID
 
-    def encode(self, text: str, add_special: bool = False) -> list[int]:
+    def encode(
+        self,
+        text: str,
+        add_special: bool = False,
+        *,
+        allow_special: bool = True,
+    ) -> list[int]:
         """
         Encode text to a flat list of token ids.  (C-TOK-1: always flat)
         """
         ids: list[int] = []
         if add_special:
             ids.append(BOS_ID)
-        for word_chars in self._pretokenize(text):
-            ids.extend(self._encode_word(word_chars))
+        segments = self._segments(text) if allow_special else ((False, text),)
+        for is_special, segment in segments:
+            if is_special:
+                ids.append(self.vocab.get(segment, UNK_ID))
+                continue
+            for word_chars in self._pretokenize(segment):
+                ids.extend(self._encode_word(word_chars))
         if add_special:
             ids.append(EOS_ID)
         return ids
 
     # ── Decode ────────────────────────────────────────────────────────────
 
-    def decode(self, ids, skip_special=True):
-        """
-        Decodes token IDs back into clean human-readable text strings,
-        safely reversing both BPE spaces and byte-fallback symbols.
-        """
-        # 1. Convert IDs back to sub-word string tokens
-        tokens = [self.inv_vocab.get(i, "<unk>") for i in ids]
+    def decode(self, ids, skip_special=True, *, errors: str = "strict"):
+        """Decode IDs exactly, optionally omitting every control token."""
+        special_set = set(SPECIAL_TOKENS)
+        parts: list[str] = []
+        byte_symbols: list[str] = []
 
-        if skip_special:
-            special_tokens = {"<pad>", "<unk>", "<bos>", "<eos>"}
-            tokens = [t for t in tokens if t not in special_tokens]
+        def flush_bytes() -> None:
+            if not byte_symbols:
+                return
+            unknown = [symbol for token in byte_symbols for symbol in token if symbol not in BYTE_DECODER]
+            if unknown:
+                raise ValueError(f"Tokenizer contains undecodable byte symbols: {unknown[:5]!r}")
+            raw_bytes = bytearray(
+                BYTE_DECODER[symbol]
+                for token in byte_symbols
+                for symbol in token
+            )
+            parts.append(raw_bytes.decode("utf-8", errors=errors))
+            byte_symbols.clear()
 
-        # 2. Concatenate the sub-word tokens tightly together
-        raw_string = "".join(tokens)
-
-        # 3. Reconstruct the standard GPT-2 style byte decoder map
-        # This translates symbols like 'Ġ', 'Ä', 'ł' back into true raw bytes
-        byte_encoder = {}
-        for b in list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(
-                range(ord("®"), ord("ÿ") + 1)):
-            byte_encoder[chr(b)] = b
-
-        # Add the specific mappings for standard whitespace and structural shifts
-        byte_encoder['Ġ'] = ord(' ')
-
-        # Build the inverse map (symbol string -> raw byte integer)
-        byte_decoder = {chr(v): k for k, v in byte_encoder.items()}
-
-        try:
-            # 4. Map the string characters back to their true underlying raw bytes
-            # If a character isn't in the byte map, we preserve it safely
-            raw_bytes = bytearray([byte_encoder[ch] if ch in byte_encoder else ord(ch) for ch in raw_string])
-
-            # 5. Decode the compiled bytearray cleanly using standard UTF-8 string rendering
-            clean_string = raw_bytes.decode('utf-8', errors='replace')
-        except Exception:
-            # Fallback if the raw sequence is too fragmented to safely parse as UTF-8 bytes
-            clean_string = raw_string.replace("Ġ", " ")
-
-        # 6. Clean up trailing/leading spaces and collapse duplicates
-        clean_string = clean_string.replace("  ", " ").strip()
-
-        return clean_string
+        for token_id in ids:
+            token = self.inv_vocab.get(int(token_id), "<unk>")
+            if token in special_set:
+                flush_bytes()
+                if not skip_special:
+                    parts.append(token)
+            else:
+                byte_symbols.append(token)
+        flush_bytes()
+        return "".join(parts)
 
     # ── Save / Load ───────────────────────────────────────────────────────
 
     def save(self, path: str):
         data = {
+            "format_version": TOKENIZER_FORMAT_VERSION,
+            "special_tokens": SPECIAL_TOKENS,
             "vocab":  self.vocab,
             "merges": [list(k) + [v] for k, v in self.merges.items()],
         }
-        with open(path, "w", encoding="utf-8") as f:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        with temporary.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)   # M-TOK-2: no indent bloat
-        log.info(f"Saved tokenizer → {path}")
+        os.replace(temporary, destination)
+        log.info(f"Saved tokenizer → {destination}")
 
     def load(self, path: str):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if data.get("format_version") != TOKENIZER_FORMAT_VERSION:
+            raise ValueError("Unsupported tokenizer format; rebuild the tokenizer")
+        if data.get("special_tokens") != SPECIAL_TOKENS:
+            raise ValueError("Tokenizer special-token mapping is incompatible")
         self.vocab     = data["vocab"]
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
         self.merges    = {(r[0], r[1]): r[2] for r in data["merges"]}
@@ -302,11 +335,11 @@ class Tokenizer:
 
     @staticmethod
     def train_from_ingest(data_dir: str, vocab_size: int = 10_000,
-                          save_path: str = "bpe.json") -> "Tokenizer":
-        """Stream from Ingest — never loads full corpus into memory. (H-TOK-4)"""
+                          save_path: str = "bpe.json", split: str = "train") -> "Tokenizer":
+        """Train from records in the requested dataset split."""
         def _text_stream():
             for doc in Ingest(data_dir).ingest():
-                if doc["text"].strip():
+                if doc.get("split", "train") == split and doc["text"].strip():
                     yield doc["text"]
 
         tok = Tokenizer()
