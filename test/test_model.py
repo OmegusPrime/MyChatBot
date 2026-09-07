@@ -54,10 +54,10 @@ class TestTransformerAndGeneration(unittest.TestCase):
         )
         self.assertEqual(generated, [3])
 
-    def test_checkpoint_loads_through_shared_chat_service(self):
+    def test_checkpoint_loads_through_legacy_chat_service(self):
         from Model.Transformer import TransformerCoreStack
         from Pipeline.tokenizer import Tokenizer
-        from chat_backend import ChatService
+        from legacy_backend import LegacyChatService
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -85,13 +85,16 @@ class TestTransformerAndGeneration(unittest.TestCase):
                 },
                 checkpoint_path,
             )
-            service = ChatService(root, device="cpu")
-            self.assertEqual(service.tokenizer.vocab_size, tokenizer.vocab_size)
-            self.assertEqual(service.reply("Hi"), "Hi! How can I help you today?")
-            self.assertIn("rephrase", service.reply("quantum zebra flux capacitor").lower())
-            service.history.extend([1, 2, 3])
-            service.reset()
-            self.assertEqual(service.history, [])
+            service = LegacyChatService(root, device="cpu")
+            try:
+                self.assertEqual(service.tokenizer.vocab_size, tokenizer.vocab_size)
+                self.assertEqual(service.reply("Hi"), "Hi! How can I help you today?")
+                self.assertIn("rephrase", service.reply("quantum zebra flux capacitor").lower())
+                self.assertTrue(service.history)
+                service.reset()
+                self.assertEqual(service.history, [])
+            finally:
+                service.close()
 
 
 if __name__ == "__main__":

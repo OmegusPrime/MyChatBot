@@ -1,163 +1,91 @@
 # MyChatBot
 
-MyChatBot is a small decoder-only PyTorch chatbot trained from the conversational files in `Dataset/`. The terminal and Tkinter interfaces share the same tokenizer, checkpoint, generation engine, and bounded conversation history.
+A local desktop and terminal chatbot. The default conversation engine is Qwen2.5-1.5B-Instruct (Q4_K_M), running through a portable llama.cpp server on this computer. It answers questions using the current conversation instead of selecting unrelated movie dialogue. No API key or model training is required for normal chat.
 
-## Requirements
+## Start chatting
 
-- Python 3.11 or 3.12
-- PyTorch-compatible CPU or CUDA environment
+On this computer, open `D:\ChatBot\MyChatBot` and double-click **Start Chatbot.cmd**. The first model load can take a few seconds. The window shows its loading status, then enables the message box.
 
-Create and activate a virtual environment, then install the project dependencies:
+- Enter sends a message.
+- New chat starts a fresh conversation.
+- Retry reloads the backend after a startup failure.
+- Closing the window stops its model server.
+
+For terminal chat:
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
+cd D:\ChatBot\MyChatBot
+.\.venv\Scripts\python.exe chat_cli.py
+```
+
+Use `RESET` or `/reset` for a new conversation, and `END` or `/exit` to leave. The existing `main_and_eval.py --chat` command also uses the new backend.
+
+## Setup on another computer or after moving the project
+
+Requirements: x64 Windows, Python 3.11 or newer with Tkinter, approximately 2 GB free disk space, and sufficient free memory for the model. Normal chat uses only the Python standard library; PyTorch is needed only for the training experiment. The current Python 3.14 environment was checked for startup compatibility.
+
+1. Use a working Python installation. If the copied `.venv` references a missing interpreter, create a new environment with that installation; virtual environments are not portable.
+2. From the project folder, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup_chatbot.ps1
+```
+
+Setup downloads about 1.14 GB from the official Qwen and llama.cpp repositories, verifies pinned SHA-256 hashes, and installs into `models/` and `runtime/`. Interrupted downloads can resume. Unexpected existing files are preserved and reported. No Windows service or global model manager is installed.
+
+3. Run **Start Chatbot.cmd**, or `python chat_gui.py`.
+
+To check the downloaded model and runtime later:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup_chatbot.ps1 -CheckOnly
+```
+
+Paths resolve relative to the source files, so starting from a different working directory is supported. When relocating, copy `models/` and `runtime/` too, or rerun setup; they are intentionally excluded from Git.
+
+## How replies work
+
+`chat_backend.ChatService` sends structured system, user, and assistant messages to the local model. Completed exchanges form the conversation history. The model's own chat template and tokenizer determine the context budget; oldest complete exchanges are removed when necessary. An overlong individual message is rejected with a clear explanation. Failed requests do not become part of the conversation.
+
+The desktop starts and generates replies on workers while all Tkinter operations stay on the main thread. A local server is started for the session on an available loopback port with a random access token. It is stopped on close. The runtime does not need internet access after setup, and this application does not send chat messages to a hosted API or save transcripts to disk.
+
+The small local model can handle everyday conversation, basic explanations, writing, and simple code. It can still make factual or reasoning mistakes. It has no live web access or access to arbitrary files, and remembers only the recent context of the current session. Reset or restart clears it. This is not a claim of large hosted-model quality.
+
+## Training experiment
+
+The original PyTorch transformer, tokenizer, datasets, preparation, and training pipeline remain available as an explicit experimental backend. They are not required to start normal chat.
+
+```powershell
 python -m pip install -r requirements.txt
+python main_and_eval.py --prepare --train
+python chat_cli.py --backend legacy
+python chat_gui.py --backend legacy
 ```
 
-If Python 3.12 is installed under a different command, use that interpreter instead of `py -3.12`.
-
-## Workflow
-
-Generated files are stored under `artifacts/` and are ignored by Git.
-
-### 1. Prepare the tokenizer and token streams
-
-```powershell
-python main_and_eval.py --prepare
-```
-
-Preparation uses explicit conversational schemas:
-
-- `movie_lines.txt` and `movie_conversations.txt` are combined into Cornell conversations.
-- `personality.csv` is parsed as alternating chat turns.
-- `train.csv`, `validation.csv`, and `test.csv` retain their dataset split.
-- Movie metadata, URLs, README text, and the unrelated PDF are excluded.
-
-Preparation also builds `artifacts/response_pairs.db`, a searchable index of real
-prompt-response pairs. To build or refresh only that index without retraining the
-tokenizer or model:
-
-```powershell
-python main_and_eval.py --index
-```
-
-To intentionally replace current prepared artifacts:
-
-```powershell
-python main_and_eval.py --rebuild
-```
-
-### 2. Train the transformer
-
-```powershell
-python main_and_eval.py --train
-```
-
-Useful development options:
-
-```powershell
-python main_and_eval.py --train --epochs 1 --max-samples 5000 --device cpu
-```
-
-Training automatically prepares missing or stale data artifacts. It saves the best validation checkpoint, including model configuration and tokenizer compatibility metadata.
-
-### 3. Start terminal chat
-
-```powershell
-python main_and_eval.py --chat
-```
-
-Type `RESET` to clear conversation history and `END` to exit.
-
-### 4. Start the desktop GUI
-
-```powershell
-python chat_gui.py
-```
-
-The GUI requires the same `artifacts/tokenizer.json` and `artifacts/chatbot_transformer.pt` created by preparation and training. It does not require MySQL.
-
-Responses use a confidence-based hybrid strategy:
-
-1. Clear common intents such as greetings and thanks receive deterministic responses.
-2. High-confidence matches use relevant replies from the conversational response index.
-3. Low-confidence messages request clarification instead of emitting unrelated sampled text.
-
-The small generative transformer remains available internally, but random model text is
-not used as the default fallback.
+The legacy backend needs a matching `artifacts/tokenizer.json` and `artifacts/chatbot_transformer.pt`; the optional dialogue index can be created with `python main_and_eval.py --index`. Use `--rebuild` only when intentionally rebuilding training artifacts. The legacy model remains too small for reliable general conversation.
 
 ## Tests
 
-Run the complete suite:
+With training dependencies installed:
 
 ```powershell
 python -m pytest -q
 ```
 
-The tests cover:
-
-- Explicit conversational ingestion and dataset split handling
-- Exact tokenizer round-trips for whitespace and Unicode
-- Special-token encoding and removal
-- Artifact preparation and token-ID bounds
-- Transformer input invariants
-- Autoregressive EOS behavior
-
-## Architecture
-
-```text
-Dataset files
-    ↓
-Pipeline.Ingest
-    ↓ role-formatted conversations
-Pipeline.Tokenizer
-    ↓ fixed token IDs
-Model.TransformerCoreStack
-    ↓ logits
-Model.ChatBotInferenceEngine
-    ↓ newly generated IDs
-ChatService
-    ├── terminal chat
-    └── Tkinter GUI
-```
-
-The vocabulary is frozen before model training. New words are represented through byte-level BPE tokens; vocabulary rows are never added dynamically after the transformer is constructed.
+The regression suite checks conversation continuity, reset, context limits, failed-request recovery, HTTP validation, process cleanup, tokenizer round trips, ingestion, retrieval, and the original tiny training/save/load workflow. See [CHATBOT_FIXES.md](CHATBOT_FIXES.md) for the repair record and real-model validation.
 
 ## Troubleshooting
 
-### Prepared artifacts are missing or stale
+- **Missing model/runtime:** run `setup_chatbot.ps1`, then Retry in the window.
+- **Copied virtual environment will not start:** recreate it using an installed Python; the launcher tests the project environment and then available Python commands.
+- **Slow first response:** allow model loading to finish. Other applications using much of the RAM/CPU may increase latency.
+- **Legacy checkpoint error:** omit `--backend legacy` for normal chat, or prepare/train a matching experimental checkpoint.
+- **Port conflicts:** each session selects an available local port; no fixed port or separately started server is required.
 
-Run:
+## Model and runtime sources
 
-```powershell
-python main_and_eval.py --prepare
-```
+- [Official Qwen model and model card](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF)
+- [Pinned llama.cpp Windows runtime release](https://github.com/ggml-org/llama.cpp/releases/tag/b10826)
+- [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 
-If the dataset or tokenizer format was intentionally changed, use `--rebuild`.
-
-### Checkpoint and tokenizer do not match
-
-Rebuild and retrain together:
-
-```powershell
-python main_and_eval.py --rebuild --train
-```
-
-### Output is readable but not coherent
-
-Confirm that training and validation loss decrease. Increase training epochs or sampled windows only after the ingestion and tokenizer tests pass. Sampling settings cannot compensate for an untrained checkpoint or malformed conversation data.
-
-### CUDA is unavailable
-
-Use CPU explicitly:
-
-```powershell
-python main_and_eval.py --train --device cpu
-python main_and_eval.py --chat --device cpu
-```
-
-## Detailed remediation record
-
-See [PROJECT_FIX_PLAN.md](PROJECT_FIX_PLAN.md) for the complete diagnosis, rationale, and acceptance criteria that guided the repair.
+The historical [PROJECT_FIX_PLAN.md](PROJECT_FIX_PLAN.md) documents the earlier training/tokenizer repairs. The current chat design and setup above supersede its default-response architecture.

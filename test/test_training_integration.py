@@ -53,11 +53,14 @@ class TestTrainingIntegration(unittest.TestCase):
                 )
 
                 self.assertTrue(checkpoint_path.exists())
-                service = ChatService(root, device="cpu")
-                response = service.reply("hi", max_new_tokens=8, temperature=0)
-                self.assertTrue(response)
-                self.assertNotIn("Ġ", response)
-                self.assertFalse(any(token in response for token in SPECIAL_TOKENS))
+                service = ChatService(root, device="cpu", backend="legacy")
+                try:
+                    response = service.reply("hi", max_new_tokens=8, temperature=0)
+                    self.assertTrue(response)
+                    self.assertNotIn("Ġ", response)
+                    self.assertFalse(any(token in response for token in SPECIAL_TOKENS))
+                finally:
+                    service.close()
         finally:
             torch.set_num_threads(previous_threads)
 

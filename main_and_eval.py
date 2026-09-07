@@ -15,11 +15,11 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import numpy as np
-
-from Pipeline.ingest import Ingest
-from Pipeline.tokenizer import EOS_ID, Tokenizer
+if TYPE_CHECKING:
+    import numpy as np
+    from Pipeline.tokenizer import Tokenizer
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATASET_DIR = BASE_DIR / "Dataset"
@@ -94,6 +94,8 @@ def _atomic_json(path: Path, value: dict) -> None:
 
 
 def _atomic_numpy(path: Path, values: np.ndarray) -> None:
+    import numpy as np
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as handle:
@@ -102,6 +104,8 @@ def _atomic_numpy(path: Path, values: np.ndarray) -> None:
 
 
 def _validate_stream(stream: np.ndarray, tokenizer: Tokenizer, name: str, *, required: bool) -> None:
+    import numpy as np
+
     if stream.ndim != 1:
         raise ValueError(f"{name} token stream must be one-dimensional")
     if not np.issubdtype(stream.dtype, np.integer):
@@ -141,6 +145,10 @@ def prepare_artifacts(
     force: bool = False,
 ) -> ArtifactPaths:
     """Build a tokenizer and split-specific token streams from clean conversations."""
+    import numpy as np
+    from Pipeline.ingest import Ingest
+    from Pipeline.tokenizer import EOS_ID, Tokenizer
+
     data_path = Path(data_dir).resolve()
     paths = artifact_paths(artifact_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -227,6 +235,9 @@ def load_prepared_artifacts(
     data_dir: str | Path = DEFAULT_DATASET_DIR,
     artifact_dir: str | Path = DEFAULT_ARTIFACT_DIR,
 ):
+    import numpy as np
+    from Pipeline.tokenizer import Tokenizer
+
     data_path = Path(data_dir).resolve()
     paths = artifact_paths(artifact_dir)
     if not _metadata_is_current(paths, data_path):
@@ -263,6 +274,7 @@ def _batches(
     rng: np.random.Generator,
     device,
 ):
+    import numpy as np
     import torch
 
     max_start = len(stream) - context_len - 1
@@ -290,6 +302,7 @@ def evaluate_model(
     seed: int,
     max_batches: int = 50,
 ) -> float:
+    import numpy as np
     import torch
     import torch.nn as nn
 
@@ -340,6 +353,7 @@ def train_generative_model(
     seed: int = 42,
     tokenizer_hash: str,
 ) -> Path:
+    import numpy as np
     import torch
     import torch.nn as nn
 
@@ -470,25 +484,12 @@ def train_command(args) -> Path:
     )
 
 
-def run_terminal_chat(artifact_dir: str | Path, device: str = "auto") -> None:
-    from chat_backend import ChatService
+def run_terminal_chat(
+    artifact_dir: str | Path, device: str = "auto", backend: str = "local"
+) -> int:
+    from chat_cli import run_terminal_chat as run_chat
 
-    service = ChatService(artifact_dir=artifact_dir, device=device)
-    print("\nMyChatBot is ready. Type END to exit and RESET to clear conversation history.\n")
-    while True:
-        user_text = input("You: ").strip()
-        if user_text.upper() == "END":
-            break
-        if user_text.upper() == "RESET":
-            service.reset()
-            print("Conversation reset.\n")
-            continue
-        if not user_text:
-            continue
-        try:
-            print(f"Chatbot: {service.reply(user_text)}\n")
-        except Exception as error:
-            print(f"Chatbot error: {error}\n")
+    return run_chat(artifact_dir, device, backend)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -508,6 +509,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-samples", type=int, default=50_000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or another torch device")
+    parser.add_argument(
+        "--backend", choices=("local", "legacy"), default="local",
+        help="chat engine; local uses the instruction model, legacy uses your training checkpoint",
+    )
     return parser
 
 
@@ -539,7 +544,7 @@ def main(argv=None) -> int:
     if args.train:
         train_command(args)
     if args.chat:
-        run_terminal_chat(args.artifact_dir, args.device)
+        return run_terminal_chat(args.artifact_dir, args.device, args.backend)
     return 0
 
 
